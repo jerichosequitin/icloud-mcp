@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { LocalAuditLog } from '../../src/audit';
+import { appendAuditLine } from '../../src/audit/writer';
 
 function entry() {
   return {
@@ -106,6 +107,48 @@ describe('local audit log', () => {
     await audit.append(entry());
     expect(diagnostics).toEqual(['iCloud MCP audit retention cleanup failed.']);
     expect(diagnostics.join('')).not.toContain(directory);
+  });
+
+  test('retries retention cleanup after a transient failure', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    const diagnostics: string[] = [];
+    let cleanupAttempts = 0;
+    class TransientCleanupAuditLog extends LocalAuditLog {
+      protected override async cleanup(): Promise<void> {
+        cleanupAttempts += 1;
+        if (cleanupAttempts === 1) {
+          throw new Error('transient cleanup failure');
+        }
+      }
+    }
+    const audit = new TransientCleanupAuditLog({
+      clock: () => new Date('2026-08-07T12:00:00.000Z'),
+      diagnostics: (message) => diagnostics.push(message),
+      directory,
+    });
+
+    await audit.append(entry());
+    await audit.append(entry());
+
+    expect(cleanupAttempts).toBe(2);
+    expect(diagnostics).toEqual(['iCloud MCP audit retention cleanup failed.']);
+  });
+
+  test('rejects a partial append before syncing it as durable', async () => {
+    let synced = false;
+    const handle = {
+      sync: async () => {
+        synced = true;
+      },
+      write: async (buffer: Uint8Array) => ({
+        bytesWritten: buffer.byteLength - 1,
+      }),
+    };
+
+    await expect(
+      appendAuditLine(handle, '{"event":"synthetic"}\n'),
+    ).rejects.toThrow('Incomplete iCloud MCP audit append.');
+    expect(synced).toBeFalse();
   });
 
   test('refuses to append through a pre-existing audit-file symlink', async () => {

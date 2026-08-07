@@ -25,6 +25,23 @@ export interface LocalAuditLogOptions {
   retentionFiles?: number;
 }
 
+interface AuditFileHandle {
+  sync(): Promise<void>;
+  write(buffer: Uint8Array): Promise<{ bytesWritten: number }>;
+}
+
+export async function appendAuditLine(
+  handle: AuditFileHandle,
+  line: string,
+): Promise<void> {
+  const encodedLine = Buffer.from(line, 'utf8');
+  const { bytesWritten } = await handle.write(encodedLine);
+  if (bytesWritten !== encodedLine.byteLength) {
+    throw new Error('Incomplete iCloud MCP audit append.');
+  }
+  await handle.sync();
+}
+
 function validRetention(value: number): boolean {
   return Number.isInteger(value) && value >= 1 && value <= 366;
 }
@@ -101,16 +118,15 @@ export class LocalAuditLog implements AuditLog {
         throw new Error('Invalid iCloud MCP audit file.');
       }
       await handle.chmod(0o600);
-      await handle.write(line, undefined, 'utf8');
-      await handle.sync();
+      await appendAuditLine(handle, line);
     } finally {
       await handle.close();
     }
 
     if (this.#lastCleanupDate !== date) {
-      this.#lastCleanupDate = date;
       try {
         await this.cleanup();
+        this.#lastCleanupDate = date;
       } catch {
         this.#diagnostics('iCloud MCP audit retention cleanup failed.');
       }
