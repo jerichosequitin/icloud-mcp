@@ -1,12 +1,37 @@
-import type { McpServer, ToolAnnotations } from '@modelcontextprotocol/server';
+import {
+  ProtocolError,
+  ProtocolErrorCode,
+  type CallToolResult,
+  type Server,
+  type Tool,
+  type ToolAnnotations,
+} from '@modelcontextprotocol/server';
+import { z } from 'zod/v4';
 
+import {
+  allowsFolder,
+  allowsTool,
+  MAIL_TOOL_NAMES,
+  type AuthenticatedPrincipal,
+  type MailToolName,
+  type ProtocolEra,
+} from '../access';
+import type {
+  AuditEntryInput,
+  AuditLog,
+  AuditReasonCode,
+  UntrustedMcpClient,
+} from '../audit';
 import type { AppleMailAdapter } from '../mail/adapter';
 import { MailAdapterError, type MailAdapterErrorCode } from '../mail/errors';
-import type {
-  GetMessageBodiesInput,
-  GetMessageMetadataInput,
-  ListFoldersInput,
-  SearchMailInput,
+import { parseFolderLocator, parseMessageLocator } from '../mail/locators';
+import {
+  MAIL_LIMITS,
+  type GetMessageBodiesInput,
+  type GetMessageMetadataInput,
+  type ListFoldersInput,
+  type ListFoldersResult,
+  type SearchMailInput,
 } from '../mail/types';
 import {
   getMessageBodiesInputSchema,
@@ -24,12 +49,7 @@ export type MailMcpAdapter = Pick<
   'getMessageBodies' | 'getMessageMetadata' | 'listFolders' | 'searchMail'
 >;
 
-export const MAIL_TOOL_NAMES = [
-  'list_folders',
-  'search_mail',
-  'get_message_metadata',
-  'get_message_bodies',
-] as const;
+export { MAIL_TOOL_NAMES };
 
 export const MAIL_TOOL_ANNOTATIONS: ToolAnnotations = {
   destructiveHint: false,
@@ -48,105 +68,333 @@ const ERROR_MESSAGES: Record<MailAdapterErrorCode, string> = {
   UNSUPPORTED_OPERATION: 'The requested Apple Mail operation is not supported.',
 };
 
-function errorResult(error: unknown) {
-  const failure =
-    error instanceof MailAdapterError
-      ? { code: error.code, message: ERROR_MESSAGES[error.code] }
-      : {
-          code: 'INTERNAL_ERROR',
-          message: 'The mail request could not be completed.',
-        };
+interface RegisterMailToolsOptions {
+  adapter: MailMcpAdapter;
+  audit: AuditLog;
+  principal: AuthenticatedPrincipal;
+  protocolEra: ProtocolEra;
+}
+
+interface ToolDefinition extends Tool {
+  outputSchema: Record<string, unknown>;
+}
+
+function inputJsonSchema(schema: z.ZodType): Tool['inputSchema'] {
+  return z.toJSONSchema(schema, { io: 'input' }) as Tool['inputSchema'];
+}
+
+const TOOL_DEFINITIONS: Record<MailToolName, ToolDefinition> = {
+  list_folders: {
+    annotations: MAIL_TOOL_ANNOTATIONS,
+    description:
+      'List readable Apple Mail folders with opaque locators. Returns no messages or message bodies.',
+    inputSchema: inputJsonSchema(listFoldersInputSchema),
+    name: 'list_folders',
+    outputSchema: z.toJSONSchema(listFoldersOutputSchema, { io: 'output' }),
+    title: 'List Mail Folders',
+  },
+  search_mail: {
+    annotations: MAIL_TOOL_ANNOTATIONS,
+    description:
+      'Search one Apple Mail folder by subject, sender, or recipient. Returns concise metadata only, never message bodies.',
+    inputSchema: inputJsonSchema(searchMailInputSchema),
+    name: 'search_mail',
+    outputSchema: z.toJSONSchema(searchMailOutputSchema, { io: 'output' }),
+    title: 'Search Mail',
+  },
+  get_message_metadata: {
+    annotations: MAIL_TOOL_ANNOTATIONS,
+    description:
+      'Get headers and Mail status for selected opaque message locators. Returns no message bodies.',
+    inputSchema: inputJsonSchema(getMessageMetadataInputSchema),
+    name: 'get_message_metadata',
+    outputSchema: z.toJSONSchema(getMessageMetadataOutputSchema, {
+      io: 'output',
+    }),
+    title: 'Get Message Metadata',
+  },
+  get_message_bodies: {
+    annotations: MAIL_TOOL_ANNOTATIONS,
+    description:
+      'Get body content only for selected opaque message locators, with explicit count and character limits.',
+    inputSchema: inputJsonSchema(getMessageBodiesInputSchema),
+    name: 'get_message_bodies',
+    outputSchema: z.toJSONSchema(getMessageBodiesOutputSchema, {
+      io: 'output',
+    }),
+    title: 'Get Message Bodies',
+  },
+};
+
+function fixedError(code: string, message: string): CallToolResult {
   return {
     content: [
-      { type: 'text' as const, text: JSON.stringify({ error: failure }) },
+      {
+        type: 'text',
+        text: JSON.stringify({ error: { code, message } }),
+      },
     ],
-    isError: true as const,
+    isError: true,
   };
 }
 
-async function callAdapter<Result>(operation: () => Promise<Result>): Promise<
-  | {
-      content: { text: string; type: 'text' }[];
-      structuredContent: Result;
-    }
-  | ReturnType<typeof errorResult>
-> {
+function errorResult(error: unknown): CallToolResult {
+  if (error instanceof MailAdapterError) {
+    return fixedError(error.code, ERROR_MESSAGES[error.code]);
+  }
+  return fixedError(
+    'INTERNAL_ERROR',
+    'The mail request could not be completed.',
+  );
+}
+
+function untrustedClient(server: Server): UntrustedMcpClient | undefined {
+  const reported = server.getClientVersion();
+  if (reported === undefined) {
+    return undefined;
+  }
+  return {
+    name: reported.name.slice(0, 200),
+    version: reported.version.slice(0, 200),
+  };
+}
+
+function auditInput(
+  server: Server,
+  options: RegisterMailToolsOptions,
+  tool: MailToolName,
+  decision: 'allow' | 'deny',
+  reason: AuditReasonCode,
+): AuditEntryInput {
+  const reportedClient = untrustedClient(server);
+  return {
+    clientId: options.principal.client.id,
+    decision,
+    protocolEra: options.protocolEra,
+    reason,
+    tool,
+    transport: options.principal.transport,
+    ...(reportedClient === undefined
+      ? {}
+      : { untrustedMcpClient: reportedClient }),
+  };
+}
+
+async function deny(
+  server: Server,
+  options: RegisterMailToolsOptions,
+  tool: MailToolName,
+  reason: AuditReasonCode,
+): Promise<CallToolResult> {
   try {
-    const structuredContent = await operation();
-    return {
-      content: [{ type: 'text', text: JSON.stringify(structuredContent) }],
-      structuredContent,
+    await options.audit.append(
+      auditInput(server, options, tool, 'deny', reason),
+    );
+  } catch {
+    // Access remains denied even when the denial record cannot be appended.
+  }
+  return fixedError('ACCESS_DENIED', 'Access denied.');
+}
+
+async function callAdapter<Result>(
+  server: Server,
+  options: RegisterMailToolsOptions,
+  tool: MailToolName,
+  outputSchema: z.ZodType,
+  operation: () => Promise<Result>,
+): Promise<CallToolResult> {
+  try {
+    await options.audit.append(
+      auditInput(server, options, tool, 'allow', 'ALLOW_POLICY'),
+    );
+    const parsed = outputSchema.safeParse(await operation());
+    if (!parsed.success) {
+      throw new MailAdapterError('MALFORMED_RESPONSE');
+    }
+    const result: CallToolResult = {
+      content: [{ type: 'text', text: JSON.stringify(parsed.data) }],
+      structuredContent: parsed.data as Record<string, unknown>,
     };
+    return server.projectCallToolResult(
+      result,
+      TOOL_DEFINITIONS[tool].outputSchema,
+    );
   } catch (error) {
     return errorResult(error);
   }
 }
 
-export function registerMailTools(
-  server: McpServer,
-  adapter: MailMcpAdapter,
-): void {
-  server.registerTool(
+function scopedFolders(
+  result: ListFoldersResult,
+  input: ListFoldersInput,
+  principal: AuthenticatedPrincipal,
+): ListFoldersResult {
+  const allowed = result.folders.filter((folder) =>
+    allowsFolder(principal.client, parseFolderLocator(folder.locator)),
+  );
+  const limit = input.limit ?? MAIL_LIMITS.folders;
+  return {
+    folders: allowed.slice(0, limit),
+    truncated:
+      allowed.length > limit ||
+      (principal.client.mailScope === '*' && result.truncated),
+  };
+}
+
+function isMailToolName(name: string): name is MailToolName {
+  return (MAIL_TOOL_NAMES as readonly string[]).includes(name);
+}
+
+function invalidInput(): CallToolResult {
+  return fixedError('INVALID_INPUT', ERROR_MESSAGES.INVALID_INPUT);
+}
+
+async function callListFolders(
+  server: Server,
+  options: RegisterMailToolsOptions,
+  rawInput: unknown,
+): Promise<CallToolResult> {
+  const input = listFoldersInputSchema.safeParse(rawInput);
+  if (!input.success) {
+    return invalidInput();
+  }
+  return callAdapter(
+    server,
+    options,
     'list_folders',
-    {
-      annotations: MAIL_TOOL_ANNOTATIONS,
-      description:
-        'List readable Apple Mail folders with opaque locators. Returns no messages or message bodies.',
-      inputSchema: listFoldersInputSchema,
-      outputSchema: listFoldersOutputSchema,
-      title: 'List Mail Folders',
-    },
-    (input) =>
-      callAdapter(() =>
-        adapter.listFolders(input as unknown as ListFoldersInput),
+    listFoldersOutputSchema,
+    async () =>
+      scopedFolders(
+        await options.adapter.listFolders({ limit: MAIL_LIMITS.folders }),
+        input.data as unknown as ListFoldersInput,
+        options.principal,
       ),
   );
+}
 
-  server.registerTool(
+async function callSearchMail(
+  server: Server,
+  options: RegisterMailToolsOptions,
+  rawInput: unknown,
+): Promise<CallToolResult> {
+  const input = searchMailInputSchema.safeParse(rawInput);
+  if (!input.success) {
+    return invalidInput();
+  }
+  if (
+    !allowsFolder(
+      options.principal.client,
+      parseFolderLocator(input.data.folder),
+    )
+  ) {
+    return deny(server, options, 'search_mail', 'DENY_FOLDER');
+  }
+  return callAdapter(
+    server,
+    options,
     'search_mail',
-    {
-      annotations: MAIL_TOOL_ANNOTATIONS,
-      description:
-        'Search one Apple Mail folder by subject, sender, or recipient. Returns concise metadata only, never message bodies.',
-      inputSchema: searchMailInputSchema,
-      outputSchema: searchMailOutputSchema,
-      title: 'Search Mail',
-    },
-    (input) =>
-      callAdapter(() =>
-        adapter.searchMail(input as unknown as SearchMailInput),
-      ),
+    searchMailOutputSchema,
+    () => options.adapter.searchMail(input.data as SearchMailInput),
   );
+}
 
-  server.registerTool(
+async function callMessageMetadata(
+  server: Server,
+  options: RegisterMailToolsOptions,
+  rawInput: unknown,
+): Promise<CallToolResult> {
+  const input = getMessageMetadataInputSchema.safeParse(rawInput);
+  if (!input.success) {
+    return invalidInput();
+  }
+  if (
+    !input.data.locators.every((locator) =>
+      allowsFolder(options.principal.client, parseMessageLocator(locator)),
+    )
+  ) {
+    return deny(server, options, 'get_message_metadata', 'DENY_FOLDER');
+  }
+  return callAdapter(
+    server,
+    options,
     'get_message_metadata',
-    {
-      annotations: MAIL_TOOL_ANNOTATIONS,
-      description:
-        'Get headers and Mail status for selected opaque message locators. Returns no message bodies.',
-      inputSchema: getMessageMetadataInputSchema,
-      outputSchema: getMessageMetadataOutputSchema,
-      title: 'Get Message Metadata',
-    },
-    (input) =>
-      callAdapter(() =>
-        adapter.getMessageMetadata(input as unknown as GetMessageMetadataInput),
+    getMessageMetadataOutputSchema,
+    () =>
+      options.adapter.getMessageMetadata(
+        input.data as unknown as GetMessageMetadataInput,
       ),
   );
+}
 
-  server.registerTool(
+async function callMessageBodies(
+  server: Server,
+  options: RegisterMailToolsOptions,
+  rawInput: unknown,
+): Promise<CallToolResult> {
+  const input = getMessageBodiesInputSchema.safeParse(rawInput);
+  if (!input.success) {
+    return invalidInput();
+  }
+  if (!options.principal.client.allowBodies) {
+    return deny(server, options, 'get_message_bodies', 'DENY_BODY');
+  }
+  if (
+    !input.data.locators.every((locator) =>
+      allowsFolder(options.principal.client, parseMessageLocator(locator)),
+    )
+  ) {
+    return deny(server, options, 'get_message_bodies', 'DENY_FOLDER');
+  }
+  return callAdapter(
+    server,
+    options,
     'get_message_bodies',
-    {
-      annotations: MAIL_TOOL_ANNOTATIONS,
-      description:
-        'Get body content only for selected opaque message locators, with explicit count and character limits.',
-      inputSchema: getMessageBodiesInputSchema,
-      outputSchema: getMessageBodiesOutputSchema,
-      title: 'Get Message Bodies',
-    },
-    (input) =>
-      callAdapter(() =>
-        adapter.getMessageBodies(input as unknown as GetMessageBodiesInput),
+    getMessageBodiesOutputSchema,
+    () =>
+      options.adapter.getMessageBodies(
+        input.data as unknown as GetMessageBodiesInput,
       ),
   );
+}
+
+async function dispatchTool(
+  server: Server,
+  options: RegisterMailToolsOptions,
+  tool: MailToolName,
+  input: unknown,
+): Promise<CallToolResult> {
+  if (!allowsTool(options.principal.client, tool)) {
+    return deny(server, options, tool, 'DENY_TOOL');
+  }
+  switch (tool) {
+    case 'list_folders':
+      return callListFolders(server, options, input);
+    case 'search_mail':
+      return callSearchMail(server, options, input);
+    case 'get_message_metadata':
+      return callMessageMetadata(server, options, input);
+    case 'get_message_bodies':
+      return callMessageBodies(server, options, input);
+  }
+}
+
+export function registerMailTools(
+  server: Server,
+  options: RegisterMailToolsOptions,
+): void {
+  server.setRequestHandler('tools/list', () => ({
+    tools: MAIL_TOOL_NAMES.filter((tool) =>
+      allowsTool(options.principal.client, tool),
+    ).map((tool) => TOOL_DEFINITIONS[tool]),
+  }));
+  server.setRequestHandler('tools/call', (request) => {
+    const tool = request.params.name;
+    if (!isMailToolName(tool)) {
+      throw new ProtocolError(
+        ProtocolErrorCode.InvalidParams,
+        'Unknown Mail tool.',
+      );
+    }
+    return dispatchTool(server, options, tool, request.params.arguments ?? {});
+  });
 }

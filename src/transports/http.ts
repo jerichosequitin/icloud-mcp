@@ -3,6 +3,14 @@ import {
   hostHeaderValidationResponse,
 } from '@modelcontextprotocol/server';
 
+import {
+  createLocalBearerAuthenticator,
+  loadAccessPolicy,
+  resolveHttpPrincipal,
+  type HttpAuthenticator,
+  type LoadedAccessPolicy,
+} from '../access';
+import { LocalAuditLog, type AuditLog } from '../audit';
 import { AppleMailAdapter } from '../mail/adapter';
 import { createMailMcpServer } from '../mcp/server';
 import type { MailMcpAdapter } from '../mcp/tools';
@@ -20,7 +28,21 @@ export interface MailHttpHandler {
 
 interface CreateMailHttpHandlerOptions {
   adapter: MailMcpAdapter;
+  audit: AuditLog;
+  authenticator?: HttpAuthenticator;
   diagnostics?: (message: string) => void;
+  policy: LoadedAccessPolicy;
+}
+
+interface StartMailHttpServerOptions extends CreateMailHttpHandlerOptions {
+  port?: number;
+}
+
+function unauthorizedResponse(): Response {
+  return new Response('Unauthorized.', {
+    headers: { 'WWW-Authenticate': 'Bearer' },
+    status: 401,
+  });
 }
 
 export function parseMailHttpPort(value: string | undefined): number {
@@ -39,13 +61,35 @@ export function parseMailHttpPort(value: string | undefined): number {
 
 export function createMailHttpHandler({
   adapter,
+  audit,
+  authenticator,
   diagnostics = (message) => console.error(message),
+  policy,
 }: CreateMailHttpHandlerOptions): MailHttpHandler {
-  const handler = createMcpHandler(() => createMailMcpServer({ adapter }), {
-    legacy: 'stateless',
-    onerror: () => diagnostics('MCP HTTP transport error.'),
-    responseMode: 'auto',
-  });
+  const activeAuthenticator =
+    authenticator ?? createLocalBearerAuthenticator(policy);
+  const handler = createMcpHandler(
+    ({ authInfo, era }) => {
+      if (authInfo === undefined) {
+        throw new Error('Missing authenticated principal.');
+      }
+      const principal = resolveHttpPrincipal(policy, authInfo);
+      if (principal === undefined) {
+        throw new Error('Unknown authenticated principal.');
+      }
+      return createMailMcpServer({
+        adapter,
+        audit,
+        principal,
+        protocolEra: era,
+      });
+    },
+    {
+      legacy: 'stateless',
+      onerror: () => diagnostics('MCP HTTP transport error.'),
+      responseMode: 'auto',
+    },
+  );
   return {
     close: handler.close,
     async fetch(request) {
@@ -59,16 +103,23 @@ export function createMailHttpHandler({
       if (new URL(request.url).pathname !== MAIL_HTTP_PATH) {
         return new Response('Not found.', { status: 404 });
       }
-      return handler.fetch(request);
+      const authInfo = await activeAuthenticator.authenticate(request);
+      if (
+        authInfo === undefined ||
+        resolveHttpPrincipal(policy, authInfo) === undefined
+      ) {
+        return unauthorizedResponse();
+      }
+      return handler.fetch(request, { authInfo });
     },
   };
 }
 
-export function startMailHttpServer(
-  adapter: MailMcpAdapter,
+export function startMailHttpServer({
   port = parseMailHttpPort(Bun.env.PORT),
-) {
-  const handler = createMailHttpHandler({ adapter });
+  ...handlerOptions
+}: StartMailHttpServerOptions) {
+  const handler = createMailHttpHandler(handlerOptions);
   return Bun.serve({
     fetch: handler.fetch,
     hostname: MAIL_HTTP_HOST,
@@ -76,9 +127,19 @@ export function startMailHttpServer(
   });
 }
 
+async function startConfiguredServer(): Promise<void> {
+  const policy = await loadAccessPolicy(Bun.env.ICLOUD_MCP_POLICY_PATH);
+  const audit = new LocalAuditLog({
+    ...(Bun.env.ICLOUD_MCP_AUDIT_DIR === undefined
+      ? {}
+      : { directory: Bun.env.ICLOUD_MCP_AUDIT_DIR }),
+  });
+  startMailHttpServer({ adapter: new AppleMailAdapter(), audit, policy });
+}
+
 if (import.meta.main) {
   try {
-    startMailHttpServer(new AppleMailAdapter());
+    await startConfiguredServer();
   } catch {
     console.error('Unable to start the local MCP HTTP server.');
     process.exitCode = 1;

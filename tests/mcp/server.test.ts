@@ -9,13 +9,24 @@ import { MailAdapterError } from '../../src/mail/errors';
 import { MAIL_LIMITS } from '../../src/mail/types';
 import { createMailMcpServer } from '../../src/mcp/server';
 import { MAIL_TOOL_ANNOTATIONS, MAIL_TOOL_NAMES } from '../../src/mcp/tools';
-import { FakeMailAdapter, SYNTHETIC_FOLDER, SYNTHETIC_MESSAGE } from './fakes';
+import {
+  FakeMailAdapter,
+  RecordingAuditLog,
+  SYNTHETIC_FOLDER,
+  SYNTHETIC_MESSAGE,
+  testPrincipal,
+} from './fakes';
 
 async function withClient<Result>(
   adapter: FakeMailAdapter,
   run: (client: Client) => Promise<Result>,
 ): Promise<Result> {
-  const server = createMailMcpServer({ adapter });
+  const server = createMailMcpServer({
+    adapter,
+    audit: new RecordingAuditLog(),
+    principal: testPrincipal(),
+    protocolEra: 'legacy',
+  });
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -109,7 +120,7 @@ describe('mail MCP tools', () => {
       );
       expect(bodies.structuredContent).toHaveProperty('messages.0.body');
       expect(adapter.calls).toEqual([
-        { input: { limit: 10 }, operation: 'listFolders' },
+        { input: { limit: MAIL_LIMITS.folders }, operation: 'listFolders' },
         {
           input: {
             field: 'subject',
