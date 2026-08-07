@@ -42,6 +42,7 @@ async function policyEnvironment(
       ],
       version: 1,
     }),
+    { mode: 0o600 },
   );
   return {
     ...inheritedEnvironment(),
