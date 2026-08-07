@@ -13,6 +13,5 @@
     "noFallthroughCasesInSwitch": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true
-  },
-  "include": ["tests/**/*.ts"]
+  }
 }
