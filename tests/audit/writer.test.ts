@@ -492,7 +492,9 @@ await withAuditFileLock(${JSON.stringify(lockPath)}, async () => {
   test('rolls over by UTC date and deletes only old exact audit filenames', async () => {
     const directory = await makeAuditDirectory();
     for (const date of ['2026-08-01', '2026-08-02', '2026-08-03']) {
-      await writeFile(join(directory, `audit-${date}.jsonl`), '{}\n');
+      const fixturePath = join(directory, `audit-${date}.jsonl`);
+      await writeFile(fixturePath, '{}\n', { mode: 0o600 });
+      expect((await stat(fixturePath)).mode & 0o777).toBe(0o600);
     }
     await writeFile(join(directory, 'audit-2026-01-01.jsonl.backup'), 'keep');
     await writeFile(join(directory, 'other.log'), 'keep');
@@ -544,7 +546,9 @@ await withAuditFileLock(${JSON.stringify(lockPath)}, async () => {
   test('preserves the active audit file when future-dated files exist', async () => {
     const directory = await makeAuditDirectory();
     for (const date of ['2027-01-01', '2027-01-02']) {
-      await writeFile(join(directory, `audit-${date}.jsonl`), '{}\n');
+      const fixturePath = join(directory, `audit-${date}.jsonl`);
+      await writeFile(fixturePath, '{}\n', { mode: 0o600 });
+      expect((await stat(fixturePath)).mode & 0o777).toBe(0o600);
     }
     const audit = new LocalAuditLog({
       clock: () => new Date('2026-08-07T12:00:00.000Z'),
