@@ -1,10 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 import {
   chmod,
+  link,
   mkdir,
   mkdtemp,
   readFile,
   readdir,
+  realpath,
+  rename,
   stat,
   symlink,
   writeFile,
@@ -14,9 +17,17 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { LocalAuditLog } from '../../src/audit';
-import { appendAuditLine, withAuditFileLock } from '../../src/audit/writer';
+import {
+  appendAuditLine,
+  openSecureAuditDirectory,
+  withAuditFileLock,
+} from '../../src/audit/writer';
 
 const TEST_DATE = '2026-08-07';
+
+async function makeAuditDirectory(): Promise<string> {
+  return await realpath(await mkdtemp(join(tmpdir(), 'icloud-audit-')));
+}
 
 function auditLockPath(directory: string): string {
   return join(directory, `.audit-${TEST_DATE}.jsonl.lock`);
@@ -43,8 +54,7 @@ describe('local audit log', () => {
   });
 
   test('writes redacted JSON Lines with secure modes and serialized appends', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
-    await chmod(directory, 0o777);
+    const directory = await makeAuditDirectory();
     let event = 0;
     const audit = new LocalAuditLog({
       clock: () => new Date('2026-08-07T23:59:59.000Z'),
@@ -75,8 +85,99 @@ describe('local audit log', () => {
     }
   });
 
+  test('syncs the audit directory only when publishing a new daily file', async () => {
+    const directory = await makeAuditDirectory();
+    let directorySyncs = 0;
+    const audit = new LocalAuditLog({
+      clock: () => new Date(`${TEST_DATE}T12:00:00.000Z`),
+      directory,
+      directorySync: async (handle) => {
+        directorySyncs += 1;
+        await handle.sync();
+      },
+    });
+
+    await audit.append(entry());
+    await audit.append(entry());
+
+    expect(directorySyncs).toBe(1);
+  });
+
+  test('fails closed before append when a new daily file cannot be made durable', async () => {
+    const directory = await makeAuditDirectory();
+    const audit = new LocalAuditLog({
+      clock: () => new Date(`${TEST_DATE}T12:00:00.000Z`),
+      directory,
+      directorySync: async () => {
+        throw new Error('synthetic directory sync failure');
+      },
+    });
+
+    await expect(audit.append(entry())).rejects.toThrow(
+      'synthetic directory sync failure',
+    );
+    expect(
+      await readFile(join(directory, `audit-${TEST_DATE}.jsonl`), 'utf8'),
+    ).toBe('');
+  });
+
+  test('rejects insecure or symlinked custom audit directory ancestry', async () => {
+    const parent = await makeAuditDirectory();
+    const insecureDirectory = join(parent, 'insecure-directory');
+    await mkdir(insecureDirectory, { mode: 0o700 });
+    await chmod(insecureDirectory, 0o777);
+    const insecureDirectoryAudit = new LocalAuditLog({
+      directory: insecureDirectory,
+    });
+    await expect(insecureDirectoryAudit.append(entry())).rejects.toThrow(
+      'Invalid iCloud MCP audit directory.',
+    );
+    expect(await stat(insecureDirectory).then(({ mode }) => mode & 0o777)).toBe(
+      0o777,
+    );
+
+    const insecureParent = join(parent, 'insecure');
+    await mkdir(insecureParent, { mode: 0o700 });
+    await chmod(insecureParent, 0o777);
+    const insecureAudit = new LocalAuditLog({
+      directory: join(insecureParent, 'audit'),
+    });
+    await expect(insecureAudit.append(entry())).rejects.toThrow(
+      'Invalid iCloud MCP audit directory.',
+    );
+
+    const realParent = join(parent, 'real');
+    await mkdir(realParent, { mode: 0o700 });
+    const linkedParent = join(parent, 'linked');
+    await symlink(realParent, linkedParent);
+    const linkedAudit = new LocalAuditLog({
+      directory: join(linkedParent, 'audit'),
+    });
+    await expect(linkedAudit.append(entry())).rejects.toThrow(
+      'Invalid iCloud MCP audit directory.',
+    );
+  });
+
+  test('fails closed when audit directory identity changes during validation', async () => {
+    const parent = await makeAuditDirectory();
+    const directory = join(parent, 'audit');
+    const replacement = join(parent, 'replacement');
+    const moved = join(parent, 'moved');
+    await mkdir(directory, { mode: 0o700 });
+    await mkdir(replacement, { mode: 0o700 });
+
+    await expect(
+      openSecureAuditDirectory(directory, {
+        beforeOpen: async () => {
+          await rename(directory, moved);
+          await rename(replacement, directory);
+        },
+      }),
+    ).rejects.toThrow('Invalid iCloud MCP audit directory.');
+  });
+
   test('serializes concurrent appends from separate audit log instances', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    const directory = await makeAuditDirectory();
     let event = 0;
     const options = {
       clock: () => new Date('2026-08-07T12:00:00.000Z'),
@@ -110,7 +211,7 @@ describe('local audit log', () => {
   });
 
   test('reclaims a valid audit lock after its owning process terminates', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    const directory = await makeAuditDirectory();
     const lockPath = auditLockPath(directory);
     const writerModule = pathToFileURL(
       join(process.cwd(), 'src', 'audit', 'writer.ts'),
@@ -155,7 +256,7 @@ await withAuditFileLock(${JSON.stringify(lockPath)}, async () => {
   });
 
   test('never reclaims a lock held by a live owner', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    const directory = await makeAuditDirectory();
     const lockPath = auditLockPath(directory);
     let markLocked: () => void = () => undefined;
     let releaseOwner: () => void = () => undefined;
@@ -185,7 +286,7 @@ await withAuditFileLock(${JSON.stringify(lockPath)}, async () => {
   });
 
   test('fails closed for malformed or insecure audit lock files', async () => {
-    const malformedDirectory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    const malformedDirectory = await makeAuditDirectory();
     const malformedPath = auditLockPath(malformedDirectory);
     await writeFile(malformedPath, '{}\n', { mode: 0o600 });
     await expect(
@@ -193,7 +294,7 @@ await withAuditFileLock(${JSON.stringify(lockPath)}, async () => {
     ).rejects.toThrow('Invalid iCloud MCP audit lock.');
     expect(await readFile(malformedPath, 'utf8')).toBe('{}\n');
 
-    const insecureDirectory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    const insecureDirectory = await makeAuditDirectory();
     const insecurePath = auditLockPath(insecureDirectory);
     await withAuditFileLock(insecurePath, async () => undefined);
     await chmod(insecurePath, 0o666);
@@ -203,7 +304,7 @@ await withAuditFileLock(${JSON.stringify(lockPath)}, async () => {
   });
 
   test('allows only one contender to reclaim and enter a stale lock', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    const directory = await makeAuditDirectory();
     const lockPath = auditLockPath(directory);
     await withAuditFileLock(lockPath, async () => undefined);
     let active = 0;
@@ -241,7 +342,7 @@ await withAuditFileLock(${JSON.stringify(lockPath)}, async () => {
   });
 
   test('rolls over by UTC date and deletes only old exact audit filenames', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    const directory = await makeAuditDirectory();
     for (const date of ['2026-08-01', '2026-08-02', '2026-08-03']) {
       await writeFile(join(directory, `audit-${date}.jsonl`), '{}\n');
     }
@@ -270,9 +371,9 @@ await withAuditFileLock(${JSON.stringify(lockPath)}, async () => {
   });
 
   test('emits only a fixed diagnostic when retention cleanup fails', async () => {
-    const parent = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    const parent = await makeAuditDirectory();
     const directory = join(parent, 'audit');
-    await mkdir(directory);
+    await mkdir(directory, { mode: 0o700 });
     const diagnostics: string[] = [];
     class FailingCleanupAuditLog extends LocalAuditLog {
       protected override async cleanup(): Promise<void> {
@@ -291,7 +392,7 @@ await withAuditFileLock(${JSON.stringify(lockPath)}, async () => {
   });
 
   test('preserves the active audit file when future-dated files exist', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    const directory = await makeAuditDirectory();
     for (const date of ['2027-01-01', '2027-01-02']) {
       await writeFile(join(directory, `audit-${date}.jsonl`), '{}\n');
     }
@@ -311,7 +412,7 @@ await withAuditFileLock(${JSON.stringify(lockPath)}, async () => {
   });
 
   test('retries retention cleanup after a transient failure', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    const directory = await makeAuditDirectory();
     const diagnostics: string[] = [];
     let cleanupAttempts = 0;
     class TransientCleanupAuditLog extends LocalAuditLog {
@@ -389,7 +490,7 @@ await withAuditFileLock(${JSON.stringify(lockPath)}, async () => {
   });
 
   test('refuses to append through a pre-existing audit-file symlink', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    const directory = await makeAuditDirectory();
     const target = join(directory, 'target');
     await writeFile(target, 'must-not-change');
     await symlink(target, join(directory, 'audit-2026-08-07.jsonl'));
@@ -400,5 +501,40 @@ await withAuditFileLock(${JSON.stringify(lockPath)}, async () => {
 
     await expect(audit.append(entry())).rejects.toThrow();
     expect(await readFile(target, 'utf8')).toBe('must-not-change');
+  });
+
+  test('rejects an insecure pre-existing audit file without repairing it', async () => {
+    const directory = await makeAuditDirectory();
+    const auditPath = join(directory, `audit-${TEST_DATE}.jsonl`);
+    await writeFile(auditPath, '{}\n', { mode: 0o644 });
+    await chmod(auditPath, 0o644);
+    const audit = new LocalAuditLog({
+      clock: () => new Date(`${TEST_DATE}T12:00:00.000Z`),
+      directory,
+    });
+
+    await expect(audit.append(entry())).rejects.toThrow(
+      'Invalid iCloud MCP audit file.',
+    );
+    expect(await stat(auditPath).then(({ mode }) => mode & 0o777)).toBe(0o644);
+    expect(await readFile(auditPath, 'utf8')).toBe('{}\n');
+  });
+
+  test('rejects a multiply-linked pre-existing audit file', async () => {
+    const directory = await makeAuditDirectory();
+    const target = join(directory, 'linked-target');
+    const auditPath = join(directory, `audit-${TEST_DATE}.jsonl`);
+    await writeFile(target, 'must-not-change', { mode: 0o600 });
+    await link(target, auditPath);
+    const audit = new LocalAuditLog({
+      clock: () => new Date(`${TEST_DATE}T12:00:00.000Z`),
+      directory,
+    });
+
+    await expect(audit.append(entry())).rejects.toThrow(
+      'Invalid iCloud MCP audit file.',
+    );
+    expect(await readFile(target, 'utf8')).toBe('must-not-change');
+    expect(await stat(target).then(({ nlink }) => nlink)).toBe(2);
   });
 });

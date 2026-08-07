@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { chmod, mkdtemp, writeFile } from 'node:fs/promises';
+import { chmod, link, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -210,6 +210,19 @@ describe('access policy configuration', () => {
       loadAccessPolicy(unsafeParent, {
         environment: { REMOTE_TOKEN: 'remote-token' },
         transport: 'http',
+      }),
+    ).rejects.toThrow('Invalid iCloud MCP access policy.');
+  });
+
+  test('rejects a multiply-linked policy file', async () => {
+    const repositoryRoot = await mkdtemp(join(tmpdir(), 'icloud-repo-'));
+    const policyPath = await writePolicy(validPolicy());
+    await link(policyPath, join(repositoryRoot, 'linked-policy.json'));
+
+    await expect(
+      loadAccessPolicy(policyPath, {
+        repositoryRoot,
+        transport: 'stdio',
       }),
     ).rejects.toThrow('Invalid iCloud MCP access policy.');
   });

@@ -116,6 +116,7 @@ async function readSecurePolicy(policyPath: string): Promise<string> {
     if (
       !file.isFile() ||
       file.uid !== expectedOwner ||
+      file.nlink !== 1 ||
       (file.mode & 0o077) !== 0
     ) {
       throw policyError();
