@@ -24,6 +24,7 @@ async function withClient<Result>(
   const server = createMailMcpServer({
     adapter,
     audit: new RecordingAuditLog(),
+    diagnostics: () => undefined,
     principal: testPrincipal(),
     protocolEra: 'legacy',
   });

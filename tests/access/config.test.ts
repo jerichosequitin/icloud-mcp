@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { loadAccessPolicy } from '../../src/access';
 import { createFolderLocator } from '../../src/mail/locators';
@@ -67,6 +67,7 @@ describe('access policy configuration', () => {
     const path = await writePolicy(validPolicy());
     const loaded = await loadAccessPolicy(path, {
       environment: { REMOTE_TOKEN: 'secret-from-launch-environment' },
+      transport: 'http',
     });
 
     expect(loaded.clients.get('local-client')?.mailScope).toEqual([
@@ -87,14 +88,16 @@ describe('access policy configuration', () => {
   });
 
   test('fails closed for missing, relative, or repository-local paths', async () => {
-    await expect(loadAccessPolicy(undefined)).rejects.toThrow(
-      'Invalid iCloud MCP access policy.',
-    );
-    await expect(loadAccessPolicy('policy.json')).rejects.toThrow(
-      'Invalid iCloud MCP access policy.',
-    );
     await expect(
-      loadAccessPolicy(join(process.cwd(), 'policy.example.json')),
+      loadAccessPolicy(undefined, { transport: 'stdio' }),
+    ).rejects.toThrow('Invalid iCloud MCP access policy.');
+    await expect(
+      loadAccessPolicy('policy.json', { transport: 'stdio' }),
+    ).rejects.toThrow('Invalid iCloud MCP access policy.');
+    await expect(
+      loadAccessPolicy(join(process.cwd(), 'policy.example.json'), {
+        transport: 'stdio',
+      }),
     ).rejects.toThrow('Invalid iCloud MCP access policy.');
   });
 
@@ -121,13 +124,47 @@ describe('access policy configuration', () => {
             EXTRA_TOKEN: 'extra-token',
             REMOTE_TOKEN: 'remote-token',
           },
+          transport: 'http',
         }),
       ).rejects.toThrow('Invalid iCloud MCP access policy.');
     }
 
     const missingSecretPath = await writePolicy(validPolicy());
     await expect(
-      loadAccessPolicy(missingSecretPath, { environment: {} }),
+      loadAccessPolicy(missingSecretPath, {
+        environment: {},
+        transport: 'http',
+      }),
+    ).rejects.toThrow('Invalid iCloud MCP access policy.');
+  });
+
+  test('does not resolve unused HTTP secrets for stdio startup', async () => {
+    const path = await writePolicy(validPolicy());
+    const loaded = await loadAccessPolicy(path, {
+      environment: {},
+      transport: 'stdio',
+    });
+    expect(loaded.clients.has('local-client')).toBe(true);
+    expect(loaded.httpCredentials).toEqual([]);
+  });
+
+  test('rejects policy files or parent directories writable by other users', async () => {
+    const groupWritableFile = await writePolicy(validPolicy());
+    await chmod(groupWritableFile, 0o660);
+    await expect(
+      loadAccessPolicy(groupWritableFile, {
+        environment: { REMOTE_TOKEN: 'remote-token' },
+        transport: 'http',
+      }),
+    ).rejects.toThrow('Invalid iCloud MCP access policy.');
+
+    const unsafeParent = await writePolicy(validPolicy());
+    await chmod(dirname(unsafeParent), 0o770);
+    await expect(
+      loadAccessPolicy(unsafeParent, {
+        environment: { REMOTE_TOKEN: 'remote-token' },
+        transport: 'http',
+      }),
     ).rejects.toThrow('Invalid iCloud MCP access policy.');
   });
 });

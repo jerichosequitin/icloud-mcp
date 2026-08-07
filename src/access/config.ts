@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { readFile, realpath } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { open, realpath, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod/v4';
@@ -8,6 +9,7 @@ import { parseFolderLocator } from '../mail/locators';
 import {
   ACCESS_POLICY_VERSION,
   MAIL_TOOL_NAMES,
+  type AccessTransport,
   type ClientAccessPolicy,
   type HttpCredential,
   type LoadedAccessPolicy,
@@ -56,6 +58,7 @@ type Environment = Readonly<Record<string, string | undefined>>;
 export interface LoadAccessPolicyOptions {
   environment?: Environment;
   repositoryRoot?: string;
+  transport: AccessTransport;
 }
 
 function policyError(): Error {
@@ -88,12 +91,46 @@ function hasDuplicate(values: readonly string[]): boolean {
   return new Set(values).size !== values.length;
 }
 
+async function readSecurePolicy(policyPath: string): Promise<string> {
+  if (process.getuid === undefined) {
+    throw policyError();
+  }
+  const expectedOwner = process.getuid();
+  const parent = await stat(dirname(policyPath));
+  if (
+    !parent.isDirectory() ||
+    parent.uid !== expectedOwner ||
+    (parent.mode & 0o022) !== 0
+  ) {
+    throw policyError();
+  }
+
+  const handle = await open(
+    policyPath,
+    constants.O_NOFOLLOW | constants.O_RDONLY,
+  );
+  try {
+    const file = await handle.stat();
+    if (
+      !file.isFile() ||
+      file.uid !== expectedOwner ||
+      (file.mode & 0o077) !== 0
+    ) {
+      throw policyError();
+    }
+    return await handle.readFile('utf8');
+  } finally {
+    await handle.close();
+  }
+}
+
 export async function loadAccessPolicy(
   configuredPath: string | undefined,
   {
     environment = process.env,
     repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..'),
-  }: LoadAccessPolicyOptions = {},
+    transport,
+  }: LoadAccessPolicyOptions,
 ): Promise<LoadedAccessPolicy> {
   if (configuredPath === undefined || !isAbsolute(configuredPath)) {
     throw policyError();
@@ -108,7 +145,7 @@ export async function loadAccessPolicy(
       throw policyError();
     }
 
-    const raw: unknown = JSON.parse(await readFile(policyPath, 'utf8'));
+    const raw: unknown = JSON.parse(await readSecurePolicy(policyPath));
     const parsed = policySchema.parse(raw);
     if (hasDuplicate(parsed.clients.map(({ id }) => id))) {
       throw policyError();
@@ -149,7 +186,7 @@ export async function loadAccessPolicy(
       };
       clients.set(client.id, client);
 
-      if (configuredClient.transport === 'http') {
+      if (transport === 'http' && configuredClient.transport === 'http') {
         const token = environment[configuredClient.bearerTokenEnv];
         if (!validToken(token)) {
           throw policyError();

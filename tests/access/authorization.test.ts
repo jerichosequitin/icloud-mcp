@@ -50,10 +50,12 @@ async function withClient<Result>(
   audit: RecordingAuditLog,
   access: AuthenticatedPrincipal,
   run: (client: Client) => Promise<Result>,
+  diagnostics: (message: string) => void = () => undefined,
 ): Promise<Result> {
   const server = createMailMcpServer({
     adapter,
     audit,
+    diagnostics,
     principal: access,
     protocolEra: 'legacy',
   });
@@ -128,7 +130,7 @@ describe('Mail access authorization', () => {
           name: 'Inbox',
         },
       ],
-      truncated: false,
+      truncated: true,
     };
     const audit = new RecordingAuditLog();
 
@@ -145,7 +147,7 @@ describe('Mail access authorization', () => {
             name: 'Inbox',
           },
         ],
-        truncated: false,
+        truncated: true,
       });
     });
 
@@ -257,5 +259,29 @@ describe('Mail access authorization', () => {
       expect(JSON.stringify(result)).not.toContain('private');
     });
     expect(adapter.calls).toHaveLength(0);
+  });
+
+  test('keeps denials fixed while reporting denial audit failures safely', async () => {
+    const adapter = new FakeMailAdapter();
+    const audit = new RecordingAuditLog();
+    const diagnostics: string[] = [];
+    audit.failure = new Error('private append failure detail');
+
+    await withClient(
+      adapter,
+      audit,
+      principal({ allowBodies: false }),
+      async (client) =>
+        expectAccessDenied(
+          await client.callTool({
+            arguments: { locators: [SYNTHETIC_MESSAGE] },
+            name: 'get_message_bodies',
+          }),
+        ),
+      (message) => diagnostics.push(message),
+    );
+    expect(adapter.calls).toHaveLength(0);
+    expect(diagnostics).toEqual(['iCloud MCP denial audit append failed.']);
+    expect(diagnostics.join('')).not.toContain('private');
   });
 });

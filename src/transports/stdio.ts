@@ -31,6 +31,7 @@ export function startMailStdio({
       createMailMcpServer({
         adapter,
         audit,
+        diagnostics,
         principal,
         protocolEra: era,
       }),
@@ -42,7 +43,9 @@ export function startMailStdio({
 }
 
 async function startConfiguredServer(): Promise<void> {
-  const policy = await loadAccessPolicy(Bun.env.ICLOUD_MCP_POLICY_PATH);
+  const policy = await loadAccessPolicy(Bun.env.ICLOUD_MCP_POLICY_PATH, {
+    transport: 'stdio',
+  });
   const principal = resolveStdioPrincipal(policy, Bun.env.ICLOUD_MCP_CLIENT_ID);
   const audit = new LocalAuditLog({
     ...(Bun.env.ICLOUD_MCP_AUDIT_DIR === undefined

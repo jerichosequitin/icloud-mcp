@@ -71,6 +71,7 @@ const ERROR_MESSAGES: Record<MailAdapterErrorCode, string> = {
 interface RegisterMailToolsOptions {
   adapter: MailMcpAdapter;
   audit: AuditLog;
+  diagnostics: (message: string) => void;
   principal: AuthenticatedPrincipal;
   protocolEra: ProtocolEra;
 }
@@ -191,7 +192,11 @@ async function deny(
       auditInput(server, options, tool, 'deny', reason),
     );
   } catch {
-    // Access remains denied even when the denial record cannot be appended.
+    try {
+      options.diagnostics('iCloud MCP denial audit append failed.');
+    } catch {
+      // Access remains denied even when diagnostics are unavailable.
+    }
   }
   return fixedError('ACCESS_DENIED', 'Access denied.');
 }
@@ -235,9 +240,7 @@ function scopedFolders(
   const limit = input.limit ?? MAIL_LIMITS.folders;
   return {
     folders: allowed.slice(0, limit),
-    truncated:
-      allowed.length > limit ||
-      (principal.client.mailScope === '*' && result.truncated),
+    truncated: result.truncated || allowed.length > limit,
   };
 }
 

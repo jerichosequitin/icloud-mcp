@@ -80,6 +80,7 @@ export function createMailHttpHandler({
       return createMailMcpServer({
         adapter,
         audit,
+        diagnostics,
         principal,
         protocolEra: era,
       });
@@ -128,7 +129,9 @@ export function startMailHttpServer({
 }
 
 async function startConfiguredServer(): Promise<void> {
-  const policy = await loadAccessPolicy(Bun.env.ICLOUD_MCP_POLICY_PATH);
+  const policy = await loadAccessPolicy(Bun.env.ICLOUD_MCP_POLICY_PATH, {
+    transport: 'http',
+  });
   const audit = new LocalAuditLog({
     ...(Bun.env.ICLOUD_MCP_AUDIT_DIR === undefined
       ? {}

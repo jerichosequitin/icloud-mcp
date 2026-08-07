@@ -7,6 +7,7 @@ import { registerMailTools, type MailMcpAdapter } from './tools';
 export interface CreateMailMcpServerOptions {
   adapter: MailMcpAdapter;
   audit: AuditLog;
+  diagnostics: (message: string) => void;
   principal: AuthenticatedPrincipal;
   protocolEra: ProtocolEra;
 }
@@ -14,6 +15,7 @@ export interface CreateMailMcpServerOptions {
 export function createMailMcpServer({
   adapter,
   audit,
+  diagnostics,
   principal,
   protocolEra,
 }: CreateMailMcpServerOptions): Server {
@@ -21,6 +23,12 @@ export function createMailMcpServer({
     { name: 'icloud-mail', version: '0.0.0' },
     { capabilities: { tools: {} } },
   );
-  registerMailTools(server, { adapter, audit, principal, protocolEra });
+  registerMailTools(server, {
+    adapter,
+    audit,
+    diagnostics,
+    principal,
+    protocolEra,
+  });
   return server;
 }

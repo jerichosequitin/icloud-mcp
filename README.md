@@ -30,7 +30,7 @@ Only `get_message_bodies` returns message body content. Every successful call re
 
 ## Access policy
 
-Set `ICLOUD_MCP_POLICY_PATH` to an absolute path for a versioned JSON policy stored outside this repository. The server refuses to start for a missing, relative, repository-local, malformed, or insecure policy. Copy [policy.example.json](policy.example.json) to a private configuration directory and replace the synthetic IDs and locators.
+Set `ICLOUD_MCP_POLICY_PATH` to an absolute path for a versioned JSON policy stored outside this repository. The policy file and its parent directory must be owned by the current user; the file must have no group or world permissions, and the parent directory must not be group- or world-writable. The server refuses to start for a missing, relative, repository-local, malformed, or insecure policy. Copy [policy.example.json](policy.example.json) to a private configuration directory, set the file mode to `0600`, and replace the synthetic IDs and locators.
 
 Each client entry requires:
 
@@ -41,7 +41,7 @@ Each client entry requires:
 - an explicit `allowBodies` boolean;
 - for HTTP only, a `bearerTokenEnv` naming an environment variable that contains the token at launch.
 
-Token values never belong in the policy. Unknown keys, duplicate client IDs, duplicate tools or locators, unknown tools, invalid locators, missing token environment variables, and transport-specific field mismatches all fail startup. Account IDs and every mailbox-path segment are compared exactly and case-sensitively. Account display names, MCP client metadata, headers other than `Authorization`, and arbitrary request metadata never establish identity.
+Token values never belong in the policy. Unknown keys, duplicate client IDs, duplicate tools or locators, unknown tools, invalid locators, HTTP token environment variables missing at HTTP startup, and transport-specific field mismatches all fail startup. Stdio startup does not resolve unused HTTP secrets from a shared policy. Account IDs and every mailbox-path segment are compared exactly and case-sensitively. Account display names, MCP client metadata, headers other than `Authorization`, and arbitrary request metadata never establish identity.
 
 `get_message_bodies` requires both tool permission and `allowBodies: true`. Folder listing is filtered to authorized locators before the requested limit is applied. Search is authorized before execution, and metadata or body batches containing any denied locator are rejected atomically.
 
