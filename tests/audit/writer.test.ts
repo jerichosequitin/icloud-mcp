@@ -11,9 +11,16 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { LocalAuditLog } from '../../src/audit';
-import { appendAuditLine } from '../../src/audit/writer';
+import { appendAuditLine, withAuditFileLock } from '../../src/audit/writer';
+
+const TEST_DATE = '2026-08-07';
+
+function auditLockPath(directory: string): string {
+  return join(directory, `.audit-${TEST_DATE}.jsonl.lock`);
+}
 
 function entry() {
   return {
@@ -95,8 +102,142 @@ describe('local audit log', () => {
       40,
     );
     expect(
-      (await readdir(directory)).some((name) => name.endsWith('.lock')),
-    ).toBe(false);
+      (await readdir(directory)).filter((name) => name.endsWith('.lock')),
+    ).toEqual([`.audit-${TEST_DATE}.jsonl.lock`]);
+    expect(
+      await stat(auditLockPath(directory)).then(({ mode }) => mode & 0o777),
+    ).toBe(0o600);
+  });
+
+  test('reclaims a valid audit lock after its owning process terminates', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    const lockPath = auditLockPath(directory);
+    const writerModule = pathToFileURL(
+      join(process.cwd(), 'src', 'audit', 'writer.ts'),
+    ).href;
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        '--eval',
+        `import { withAuditFileLock } from ${JSON.stringify(writerModule)};
+await withAuditFileLock(${JSON.stringify(lockPath)}, async () => {
+  console.log('locked');
+  await new Promise(() => undefined);
+});`,
+      ],
+      { stderr: 'pipe', stdout: 'pipe' },
+    );
+    const reader = child.stdout.getReader();
+    try {
+      const { value } = await reader.read();
+      expect(new TextDecoder().decode(value)).toContain('locked');
+    } finally {
+      reader.releaseLock();
+      child.kill('SIGKILL');
+      await child.exited;
+    }
+
+    const audit = new LocalAuditLog({
+      clock: () => new Date(`${TEST_DATE}T12:00:00.000Z`),
+      directory,
+      eventId: () => 'reclaimed-event',
+    });
+    await audit.append(entry());
+
+    const record = await readFile(
+      join(directory, `audit-${TEST_DATE}.jsonl`),
+      'utf8',
+    );
+    expect(JSON.parse(record).eventId).toBe('reclaimed-event');
+    expect(await readFile(lockPath, 'utf8')).toContain(
+      `"pid":"${String(process.pid).padStart(10, '0')}"`,
+    );
+  });
+
+  test('never reclaims a lock held by a live owner', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    const lockPath = auditLockPath(directory);
+    let markLocked: () => void = () => undefined;
+    let releaseOwner: () => void = () => undefined;
+    const locked = new Promise<void>((resolveLocked) => {
+      markLocked = resolveLocked;
+    });
+    const holdOwner = new Promise<void>((resolveOwner) => {
+      releaseOwner = resolveOwner;
+    });
+    const owner = withAuditFileLock(lockPath, async () => {
+      markLocked();
+      await holdOwner;
+    });
+    await locked;
+
+    try {
+      await expect(
+        withAuditFileLock(lockPath, async () => undefined, {
+          retryDelay: async () => undefined,
+          retryLimit: 2,
+        }),
+      ).rejects.toThrow('Unable to acquire iCloud MCP audit lock.');
+    } finally {
+      releaseOwner();
+      await owner;
+    }
+  });
+
+  test('fails closed for malformed or insecure audit lock files', async () => {
+    const malformedDirectory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    const malformedPath = auditLockPath(malformedDirectory);
+    await writeFile(malformedPath, '{}\n', { mode: 0o600 });
+    await expect(
+      withAuditFileLock(malformedPath, async () => undefined),
+    ).rejects.toThrow('Invalid iCloud MCP audit lock.');
+    expect(await readFile(malformedPath, 'utf8')).toBe('{}\n');
+
+    const insecureDirectory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    const insecurePath = auditLockPath(insecureDirectory);
+    await withAuditFileLock(insecurePath, async () => undefined);
+    await chmod(insecurePath, 0o666);
+    await expect(
+      withAuditFileLock(insecurePath, async () => undefined),
+    ).rejects.toThrow('Invalid iCloud MCP audit lock.');
+  });
+
+  test('allows only one contender to reclaim and enter a stale lock', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    const lockPath = auditLockPath(directory);
+    await withAuditFileLock(lockPath, async () => undefined);
+    let active = 0;
+    let maximumActive = 0;
+    const entered: number[] = [];
+
+    await Promise.all(
+      [1, 2].map((contender) =>
+        withAuditFileLock(lockPath, async () => {
+          active += 1;
+          maximumActive = Math.max(maximumActive, active);
+          entered.push(contender);
+          await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+          active -= 1;
+        }),
+      ),
+    );
+
+    expect(maximumActive).toBe(1);
+    expect(entered.sort()).toEqual([1, 2]);
+    const lockContents = await readFile(lockPath, 'utf8');
+    expect(lockContents).toMatch(
+      /^\{"ownerId":"[0-9a-f-]+","pid":"\d{10}","schemaVersion":1\}\n$/,
+    );
+    for (const forbidden of [
+      'client',
+      'token',
+      'locator',
+      'query',
+      'subject',
+      'body',
+    ]) {
+      expect(lockContents.toLowerCase()).not.toContain(forbidden);
+    }
   });
 
   test('rolls over by UTC date and deletes only old exact audit filenames', async () => {
@@ -118,6 +259,8 @@ describe('local audit log', () => {
     await audit.append(entry());
 
     expect((await readdir(directory)).sort()).toEqual([
+      '.audit-2026-08-04.jsonl.lock',
+      '.audit-2026-08-05.jsonl.lock',
       'audit-2026-01-01.jsonl.backup',
       'audit-2026-08-03.jsonl',
       'audit-2026-08-04.jsonl',
@@ -161,6 +304,7 @@ describe('local audit log', () => {
     await audit.append(entry());
 
     expect((await readdir(directory)).sort()).toEqual([
+      '.audit-2026-08-07.jsonl.lock',
       'audit-2026-08-07.jsonl',
       'audit-2027-01-02.jsonl',
     ]);
