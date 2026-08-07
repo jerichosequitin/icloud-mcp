@@ -1,7 +1,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { constants } from 'node:fs';
 import { open, realpath, stat } from 'node:fs/promises';
-import { dirname, isAbsolute, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod/v4';
 
@@ -70,7 +70,9 @@ function isWithin(candidate: string, parent: string): boolean {
   const pathFromParent = relative(parent, candidate);
   return (
     pathFromParent === '' ||
-    (!pathFromParent.startsWith('..') && !isAbsolute(pathFromParent))
+    (!isAbsolute(pathFromParent) &&
+      pathFromParent !== '..' &&
+      !pathFromParent.startsWith(`..${sep}`))
   );
 }
 

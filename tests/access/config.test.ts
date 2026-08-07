@@ -99,6 +99,18 @@ describe('access policy configuration', () => {
         transport: 'stdio',
       }),
     ).rejects.toThrow('Invalid iCloud MCP access policy.');
+
+    const repositoryRoot = await mkdtemp(join(tmpdir(), 'icloud-repo-'));
+    const leadingDotsPath = join(repositoryRoot, '..policy.json');
+    await writeFile(leadingDotsPath, JSON.stringify(validPolicy()), {
+      mode: 0o600,
+    });
+    await expect(
+      loadAccessPolicy(leadingDotsPath, {
+        repositoryRoot,
+        transport: 'stdio',
+      }),
+    ).rejects.toThrow('Invalid iCloud MCP access policy.');
   });
 
   test('rejects unknown keys, IDs, tools, locators, secrets, and transport mismatches', async () => {

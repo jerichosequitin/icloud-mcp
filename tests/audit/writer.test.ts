@@ -27,6 +27,14 @@ function entry() {
 }
 
 describe('local audit log', () => {
+  test('rejects blank and relative audit directories before resolving them', () => {
+    for (const directory of ['', '   ', '.']) {
+      expect(() => new LocalAuditLog({ directory })).toThrow(
+        'Invalid iCloud MCP audit configuration.',
+      );
+    }
+  });
+
   test('writes redacted JSON Lines with secure modes and serialized appends', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
     await chmod(directory, 0o777);

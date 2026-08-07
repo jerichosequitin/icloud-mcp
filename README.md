@@ -75,7 +75,7 @@ Do not expose the HTTP server through a tunnel, proxy, DNS record, or public lis
 
 ## Local audit log
 
-Audit entries are JSON Lines in `~/Library/Logs/icloud-mcp` by default. Set `ICLOUD_MCP_AUDIT_DIR` to use another local directory. Files roll over at UTC midnight as `audit-YYYY-MM-DD.jsonl`; the directory is mode `0700`, files are mode `0600`, and the latest 30 daily files are retained.
+Audit entries are JSON Lines in `~/Library/Logs/icloud-mcp` by default. Set `ICLOUD_MCP_AUDIT_DIR` to a non-empty absolute path to use another local directory. Files roll over at UTC midnight as `audit-YYYY-MM-DD.jsonl`; the directory is mode `0700`, files are mode `0600`, and the latest 30 daily files are retained.
 
 Each record contains only a schema version, UTC timestamp, random event ID, authenticated client ID, transport, tool, allow or deny decision, fixed reason code, and protocol era. Untrusted MCP client metadata is omitted. Audit entries never contain bearer tokens, headers, policy scopes, queries, locators, Mail identifiers or content, adapter output, stack traces, or raw errors. If an allow record cannot be durably appended, the adapter is not invoked.
 

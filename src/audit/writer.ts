@@ -1,7 +1,7 @@
 import { constants } from 'node:fs';
 import { chmod, lstat, mkdir, open, readdir, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import {
@@ -67,7 +67,8 @@ export class LocalAuditLog implements AuditLog {
     retentionFiles = DEFAULT_AUDIT_RETENTION_FILES,
   }: LocalAuditLogOptions = {}) {
     if (
-      !resolve(directory).startsWith('/') ||
+      directory.trim().length === 0 ||
+      !isAbsolute(directory) ||
       !validRetention(retentionFiles)
     ) {
       throw new Error('Invalid iCloud MCP audit configuration.');
