@@ -45,6 +45,10 @@ function unauthorizedResponse(): Response {
   });
 }
 
+function forbiddenResponse(): Response {
+  return new Response('Forbidden.', { status: 403 });
+}
+
 export function parseMailHttpPort(value: string | undefined): number {
   if (value === undefined) {
     return MAIL_HTTP_DEFAULT_PORT;
@@ -66,6 +70,7 @@ export function createMailHttpHandler({
   diagnostics = (message) => console.error(message),
   policy,
 }: CreateMailHttpHandlerOptions): MailHttpHandler {
+  const sessionOwners = new Map<string, string>();
   const activeAuthenticator =
     authenticator ?? createLocalBearerAuthenticator(policy);
   const handler = createMcpHandler(
@@ -92,7 +97,10 @@ export function createMailHttpHandler({
     },
   );
   return {
-    close: handler.close,
+    async close() {
+      sessionOwners.clear();
+      await handler.close();
+    },
     async fetch(request) {
       const hostFailure = hostHeaderValidationResponse(
         request,
@@ -105,13 +113,38 @@ export function createMailHttpHandler({
         return new Response('Not found.', { status: 404 });
       }
       const authInfo = await activeAuthenticator.authenticate(request);
-      if (
-        authInfo === undefined ||
-        resolveHttpPrincipal(policy, authInfo) === undefined
-      ) {
+      const principal =
+        authInfo === undefined
+          ? undefined
+          : resolveHttpPrincipal(policy, authInfo);
+      if (authInfo === undefined || principal === undefined) {
         return unauthorizedResponse();
       }
-      return handler.fetch(request, { authInfo });
+      const requestSessionId = request.headers.get('mcp-session-id');
+      if (
+        requestSessionId !== null &&
+        sessionOwners.get(requestSessionId) !== principal.client.id
+      ) {
+        return forbiddenResponse();
+      }
+
+      const response = await handler.fetch(request, { authInfo });
+      const responseSessionId = response.headers.get('mcp-session-id');
+      if (responseSessionId !== null) {
+        const owner = sessionOwners.get(responseSessionId);
+        if (owner !== undefined && owner !== principal.client.id) {
+          return forbiddenResponse();
+        }
+        sessionOwners.set(responseSessionId, principal.client.id);
+      }
+      if (
+        request.method === 'DELETE' &&
+        requestSessionId !== null &&
+        response.ok
+      ) {
+        sessionOwners.delete(requestSessionId);
+      }
+      return response;
     },
   };
 }

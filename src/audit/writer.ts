@@ -11,6 +11,8 @@ import {
 } from './schema';
 
 const AUDIT_FILENAME_PATTERN = /^audit-(\d{4}-\d{2}-\d{2})\.jsonl$/;
+const AUDIT_LOCK_RETRY_DELAY_MS = 5;
+const AUDIT_LOCK_RETRY_LIMIT = 200;
 export const DEFAULT_AUDIT_RETENTION_FILES = 30;
 
 export interface AuditLog {
@@ -26,8 +28,26 @@ export interface LocalAuditLogOptions {
 }
 
 interface AuditFileHandle {
+  stat(): Promise<{ size: number }>;
   sync(): Promise<void>;
+  truncate(length: number): Promise<void>;
   write(buffer: Uint8Array): Promise<{ bytesWritten: number }>;
+}
+
+async function repairIncompleteAppend(
+  handle: AuditFileHandle,
+  safeBoundary: number,
+  completeBoundary: number,
+): Promise<void> {
+  const { size } = await handle.stat();
+  if (size === safeBoundary || size === completeBoundary) {
+    return;
+  }
+  if (size < safeBoundary || size > completeBoundary) {
+    throw new Error('Unable to repair iCloud MCP audit append.');
+  }
+  await handle.truncate(safeBoundary);
+  await handle.sync();
 }
 
 export async function appendAuditLine(
@@ -35,11 +55,97 @@ export async function appendAuditLine(
   line: string,
 ): Promise<void> {
   const encodedLine = Buffer.from(line, 'utf8');
-  const { bytesWritten } = await handle.write(encodedLine);
-  if (bytesWritten !== encodedLine.byteLength) {
-    throw new Error('Incomplete iCloud MCP audit append.');
+  const safeBoundary = (await handle.stat()).size;
+  let writeComplete = false;
+  try {
+    const { bytesWritten } = await handle.write(encodedLine);
+    writeComplete = bytesWritten === encodedLine.byteLength;
+    if (!writeComplete) {
+      throw new Error('Incomplete iCloud MCP audit append.');
+    }
+    await handle.sync();
+  } catch (error) {
+    if (!writeComplete) {
+      try {
+        await repairIncompleteAppend(
+          handle,
+          safeBoundary,
+          safeBoundary + encodedLine.byteLength,
+        );
+      } catch {
+        throw new Error('Unable to repair iCloud MCP audit append.');
+      }
+    }
+    throw error;
   }
-  await handle.sync();
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null || !('code' in error)) {
+    return undefined;
+  }
+  return String(error.code);
+}
+
+async function delay(milliseconds: number): Promise<void> {
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
+}
+
+async function withAuditFileLock<T>(
+  lockPath: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  let lockHandle: Awaited<ReturnType<typeof open>> | undefined;
+  for (let attempt = 0; attempt < AUDIT_LOCK_RETRY_LIMIT; attempt += 1) {
+    try {
+      lockHandle = await open(
+        lockPath,
+        constants.O_CREAT |
+          constants.O_EXCL |
+          constants.O_NOFOLLOW |
+          constants.O_WRONLY,
+        0o600,
+      );
+      break;
+    } catch (error) {
+      if (errorCode(error) !== 'EEXIST') {
+        throw error;
+      }
+      await delay(AUDIT_LOCK_RETRY_DELAY_MS);
+    }
+  }
+  if (lockHandle === undefined) {
+    throw new Error('Unable to acquire iCloud MCP audit lock.');
+  }
+
+  let operationResult: T | undefined;
+  let operationFailure: unknown;
+  let operationFailed = false;
+  try {
+    operationResult = await operation();
+  } catch (error) {
+    operationFailed = true;
+    operationFailure = error;
+  }
+
+  let releaseFailed = false;
+  try {
+    await lockHandle.close();
+  } catch {
+    releaseFailed = true;
+  }
+  try {
+    await unlink(lockPath);
+  } catch {
+    releaseFailed = true;
+  }
+  if (releaseFailed) {
+    throw new Error('Unable to release iCloud MCP audit lock.');
+  }
+  if (operationFailed) {
+    throw operationFailure;
+  }
+  return operationResult as T;
 }
 
 function validRetention(value: number): boolean {
@@ -107,23 +213,28 @@ export class LocalAuditLog implements AuditLog {
       throw new Error('Invalid iCloud MCP audit directory.');
     }
     await chmod(this.#directory, 0o700);
-    const handle = await open(
-      join(this.#directory, activeFilename),
-      constants.O_APPEND |
-        constants.O_CREAT |
-        constants.O_NOFOLLOW |
-        constants.O_WRONLY,
-      0o600,
+    await withAuditFileLock(
+      join(this.#directory, `.${activeFilename}.lock`),
+      async () => {
+        const handle = await open(
+          join(this.#directory, activeFilename),
+          constants.O_APPEND |
+            constants.O_CREAT |
+            constants.O_NOFOLLOW |
+            constants.O_WRONLY,
+          0o600,
+        );
+        try {
+          if (!(await handle.stat()).isFile()) {
+            throw new Error('Invalid iCloud MCP audit file.');
+          }
+          await handle.chmod(0o600);
+          await appendAuditLine(handle, line);
+        } finally {
+          await handle.close();
+        }
+      },
     );
-    try {
-      if (!(await handle.stat()).isFile()) {
-        throw new Error('Invalid iCloud MCP audit file.');
-      }
-      await handle.chmod(0o600);
-      await appendAuditLine(handle, line);
-    } finally {
-      await handle.close();
-    }
 
     if (this.#lastCleanupDate !== date) {
       try {

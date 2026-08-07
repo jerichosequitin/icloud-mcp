@@ -68,6 +68,37 @@ describe('local audit log', () => {
     }
   });
 
+  test('serializes concurrent appends from separate audit log instances', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    let event = 0;
+    const options = {
+      clock: () => new Date('2026-08-07T12:00:00.000Z'),
+      directory,
+      eventId: () => `cross-process-${++event}`,
+    };
+    const firstAudit = new LocalAuditLog(options);
+    const secondAudit = new LocalAuditLog(options);
+
+    await Promise.all(
+      Array.from({ length: 40 }, (_, index) =>
+        (index % 2 === 0 ? firstAudit : secondAudit).append(entry()),
+      ),
+    );
+
+    const lines = (
+      await readFile(join(directory, 'audit-2026-08-07.jsonl'), 'utf8')
+    )
+      .trim()
+      .split('\n');
+    expect(lines).toHaveLength(40);
+    expect(new Set(lines.map((line) => JSON.parse(line).eventId)).size).toBe(
+      40,
+    );
+    expect(
+      (await readdir(directory)).some((name) => name.endsWith('.lock')),
+    ).toBe(false);
+  });
+
   test('rolls over by UTC date and deletes only old exact audit filenames', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
     for (const date of ['2026-08-01', '2026-08-02', '2026-08-03']) {
@@ -160,21 +191,57 @@ describe('local audit log', () => {
     expect(diagnostics).toEqual(['iCloud MCP audit retention cleanup failed.']);
   });
 
-  test('rejects a partial append before syncing it as durable', async () => {
-    let synced = false;
+  test('repairs a partial append to the known safe boundary', async () => {
+    const safeBoundary = 128;
+    let size = safeBoundary;
+    const truncations: number[] = [];
+    let syncCount = 0;
     const handle = {
+      stat: async () => ({ size }),
       sync: async () => {
-        synced = true;
+        syncCount += 1;
       },
-      write: async (buffer: Uint8Array) => ({
-        bytesWritten: buffer.byteLength - 1,
-      }),
+      truncate: async (length: number) => {
+        truncations.push(length);
+        size = length;
+      },
+      write: async (buffer: Uint8Array) => {
+        const bytesWritten = buffer.byteLength - 1;
+        size += bytesWritten;
+        return { bytesWritten };
+      },
     };
 
     await expect(
       appendAuditLine(handle, '{"event":"synthetic"}\n'),
     ).rejects.toThrow('Incomplete iCloud MCP audit append.');
-    expect(synced).toBeFalse();
+    expect(size).toBe(safeBoundary);
+    expect(truncations).toEqual([safeBoundary]);
+    expect(syncCount).toBe(1);
+  });
+
+  test('repairs a write failure after partial bytes without truncating complete records', async () => {
+    const completeRecord = '{"event":"complete"}\n';
+    const failedRecord = '{"event":"failed"}\n';
+    let contents = completeRecord;
+    const safeBoundary = Buffer.byteLength(completeRecord);
+    const handle = {
+      stat: async () => ({ size: Buffer.byteLength(contents) }),
+      sync: async () => undefined,
+      truncate: async (length: number) => {
+        contents = Buffer.from(contents).subarray(0, length).toString('utf8');
+      },
+      write: async (buffer: Uint8Array) => {
+        contents += Buffer.from(buffer).subarray(0, 5).toString('utf8');
+        throw new Error('synthetic write failure');
+      },
+    };
+
+    await expect(appendAuditLine(handle, failedRecord)).rejects.toThrow(
+      'synthetic write failure',
+    );
+    expect(Buffer.byteLength(contents)).toBe(safeBoundary);
+    expect(contents).toBe(completeRecord);
   });
 
   test('refuses to append through a pre-existing audit-file symlink', async () => {

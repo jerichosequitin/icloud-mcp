@@ -160,6 +160,23 @@ describe('access policy configuration', () => {
     expect(loaded.httpCredentials).toEqual([]);
   });
 
+  test('rejects HTTP startup when the policy has no HTTP client', async () => {
+    const policy = validPolicy();
+    policy.clients = [policy.clients[0]!];
+    const path = await writePolicy(policy);
+
+    await expect(
+      loadAccessPolicy(path, { environment: {}, transport: 'http' }),
+    ).rejects.toThrow('Invalid iCloud MCP access policy.');
+
+    const stdioPolicy = await loadAccessPolicy(path, {
+      environment: {},
+      transport: 'stdio',
+    });
+    expect(stdioPolicy.clients.has('local-client')).toBe(true);
+    expect(stdioPolicy.httpCredentials).toEqual([]);
+  });
+
   test('rejects bearer tokens outside the transport-safe token syntax', async () => {
     for (const token of [
       'contains space',

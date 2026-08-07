@@ -4,8 +4,10 @@ import {
   StreamableHTTPClientTransport,
   type FetchLike,
 } from '@modelcontextprotocol/client';
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:net';
 
+import type { ClientAccessPolicy, LoadedAccessPolicy } from '../../src/access';
 import {
   createMailHttpHandler,
   MAIL_HTTP_DEFAULT_PORT,
@@ -16,12 +18,39 @@ import {
 import {
   FakeMailAdapter,
   RecordingAuditLog,
+  TEST_HTTP_CLIENT,
   TEST_HTTP_TOKEN,
   TEST_POLICY,
 } from './fakes';
 
 const openHandlers: { close(): Promise<void> }[] = [];
 const openServers: Bun.Server<unknown>[] = [];
+const SECOND_HTTP_TOKEN = 'synthetic-second-http-token';
+
+function twoClientHttpPolicy(): LoadedAccessPolicy {
+  const secondClient: ClientAccessPolicy = {
+    ...TEST_HTTP_CLIENT,
+    bearerTokenEnv: 'SECOND_HTTP_TOKEN',
+    id: 'test-http-second',
+    tools: new Set(TEST_HTTP_CLIENT.tools),
+  };
+  return {
+    clients: new Map([
+      ...TEST_POLICY.clients,
+      [secondClient.id, secondClient] as const,
+    ]),
+    httpCredentials: [
+      ...TEST_POLICY.httpCredentials,
+      {
+        clientId: secondClient.id,
+        tokenDigest: createHash('sha256')
+          .update(SECOND_HTTP_TOKEN, 'utf8')
+          .digest(),
+      },
+    ],
+    version: TEST_POLICY.version,
+  };
+}
 
 async function ephemeralLoopbackPort(): Promise<number> {
   const reservation = createServer();
@@ -176,6 +205,42 @@ describe('Streamable HTTP transport', () => {
     expect(response.headers.get('www-authenticate')).toBe('Bearer');
     expect(await response.text()).toBe('Unauthorized.');
     expect(response.headers.has('access-control-allow-origin')).toBe(false);
+  });
+
+  test('rejects a valid client supplying an unbound modern session before dispatch', async () => {
+    const adapter = new FakeMailAdapter();
+    const handler = createMailHttpHandler({
+      adapter,
+      audit: new RecordingAuditLog(),
+      diagnostics: () => undefined,
+      policy: twoClientHttpPolicy(),
+    });
+    openHandlers.push(handler);
+    const response = await handler.fetch(
+      new Request(`http://${MAIL_HTTP_HOST}${MAIL_HTTP_PATH}`, {
+        body: JSON.stringify({
+          id: 1,
+          jsonrpc: '2.0',
+          method: 'tools/call',
+          params: { arguments: { limit: 1 }, name: 'list_folders' },
+        }),
+        headers: {
+          accept: 'application/json, text/event-stream',
+          authorization: `Bearer ${SECOND_HTTP_TOKEN}`,
+          'content-type': 'application/json',
+          host: MAIL_HTTP_HOST,
+          'mcp-protocol-version': '2026-07-28',
+          'mcp-session-id': 'synthetic-session-from-another-client',
+        },
+        method: 'POST',
+      }),
+    );
+
+    expect(response.status).toBe(403);
+    expect(await response.text()).toBe('Forbidden.');
+    expect(response.headers.has('mcp-session-id')).toBe(false);
+    expect(response.headers.has('access-control-allow-origin')).toBe(false);
+    expect(adapter.calls).toEqual([]);
   });
 
   test('rejects hostile Hosts and routes other than /mcp', async () => {

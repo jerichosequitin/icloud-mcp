@@ -202,6 +202,10 @@ export async function loadAccessPolicy(
       }
     }
 
+    if (transport === 'http' && httpCredentials.length === 0) {
+      throw policyError();
+    }
+
     return {
       clients,
       httpCredentials,
