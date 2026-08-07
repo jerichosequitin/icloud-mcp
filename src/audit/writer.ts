@@ -5,6 +5,7 @@ import {
   fstat,
   fsync,
   ftruncate,
+  read,
   write,
 } from 'node:fs';
 import {
@@ -21,7 +22,9 @@ import { isAbsolute, join, parse, resolve, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { dlopen, FFIType } from 'bun:ffi';
 
+import { MAIL_TOOL_NAMES } from '../access/types';
 import {
+  AUDIT_REASON_CODES,
   AUDIT_SCHEMA_VERSION,
   type AuditEntry,
   type AuditEntryInput,
@@ -37,6 +40,8 @@ const LOCK_EXCLUSIVE_NONBLOCKING = 2 | 4;
 const LOCK_RELEASE = 8;
 const OPEN_CLOSE_ON_EXEC =
   process.platform === 'darwin' ? 0x01000000 : 0x00080000;
+const MAX_AUDIT_RECORD_BYTES = 16_384;
+const MAX_AUDIT_TAIL_BYTES = MAX_AUDIT_RECORD_BYTES * 2 + 2;
 const libc = dlopen(
   process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : 'libc.so.6',
   {
@@ -72,7 +77,19 @@ interface AuditFileHandle {
   write(buffer: Uint8Array): Promise<{ bytesWritten: number }>;
 }
 
-interface SecureAuditFileHandle extends AuditFileHandle {
+interface AuditTailHandle {
+  read(
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number,
+  ): Promise<{ bytesRead: number }>;
+  stat(): Promise<{ size: number }>;
+  sync(): Promise<void>;
+  truncate(length: number): Promise<void>;
+}
+
+interface SecureAuditFileHandle extends AuditFileHandle, AuditTailHandle {
   chmod(mode: number): Promise<void>;
   close(): Promise<void>;
   readonly fd: number;
@@ -130,6 +147,149 @@ export async function appendAuditLine(
       }
     }
     throw error;
+  }
+}
+
+function invalidAuditTail(): Error {
+  return new Error('Invalid iCloud MCP audit file tail.');
+}
+
+async function readAuditTail(
+  handle: AuditTailHandle,
+  position: number,
+  length: number,
+): Promise<Buffer> {
+  const buffer = Buffer.alloc(length);
+  let bytesRead = 0;
+  while (bytesRead < length) {
+    const result = await handle.read(
+      buffer,
+      bytesRead,
+      length - bytesRead,
+      position + bytesRead,
+    );
+    if (result.bytesRead <= 0) {
+      throw invalidAuditTail();
+    }
+    bytesRead += result.bytesRead;
+  }
+  return buffer;
+}
+
+function previousNewline(buffer: Buffer, beforeExclusive: number): number {
+  return beforeExclusive <= 0
+    ? -1
+    : buffer.lastIndexOf(0x0a, beforeExclusive - 1);
+}
+
+function validateCompleteAuditRecord(
+  buffer: Buffer,
+  boundary: number,
+  fileOffset: number,
+): void {
+  const previousBoundary = previousNewline(buffer, boundary);
+  if (previousBoundary < 0 && fileOffset > 0) {
+    throw invalidAuditTail();
+  }
+  const recordStart = previousBoundary + 1;
+  const recordLength = boundary - recordStart;
+  if (recordLength <= 0 || recordLength > MAX_AUDIT_RECORD_BYTES) {
+    throw invalidAuditTail();
+  }
+  try {
+    const decoded = new TextDecoder('utf-8', { fatal: true }).decode(
+      buffer.subarray(recordStart, boundary),
+    );
+    const parsed: unknown = JSON.parse(decoded);
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      Array.isArray(parsed)
+    ) {
+      throw invalidAuditTail();
+    }
+    const record = parsed as Record<string, unknown>;
+    const expectedKeys = [
+      'clientId',
+      'decision',
+      'eventId',
+      'protocolEra',
+      'reason',
+      'schemaVersion',
+      'timestamp',
+      'tool',
+      'transport',
+    ];
+    if (
+      Object.keys(record).length !== expectedKeys.length ||
+      expectedKeys.some((key) => !(key in record)) ||
+      typeof record.clientId !== 'string' ||
+      record.clientId.length === 0 ||
+      (record.decision !== 'allow' && record.decision !== 'deny') ||
+      typeof record.eventId !== 'string' ||
+      record.eventId.length === 0 ||
+      (record.protocolEra !== 'legacy' && record.protocolEra !== 'modern') ||
+      !AUDIT_REASON_CODES.includes(record.reason as never) ||
+      record.schemaVersion !== AUDIT_SCHEMA_VERSION ||
+      typeof record.timestamp !== 'string' ||
+      !MAIL_TOOL_NAMES.includes(record.tool as never) ||
+      (record.transport !== 'http' && record.transport !== 'stdio')
+    ) {
+      throw invalidAuditTail();
+    }
+    if (new Date(record.timestamp).toISOString() !== record.timestamp) {
+      throw invalidAuditTail();
+    }
+  } catch {
+    throw invalidAuditTail();
+  }
+}
+
+export async function validateAndRepairAuditTail(
+  handle: AuditTailHandle,
+): Promise<void> {
+  const { size } = await handle.stat();
+  if (!Number.isSafeInteger(size) || size < 0) {
+    throw invalidAuditTail();
+  }
+  if (size === 0) {
+    return;
+  }
+
+  const tailLength = Math.min(size, MAX_AUDIT_TAIL_BYTES);
+  const tailOffset = size - tailLength;
+  const tail = await readAuditTail(handle, tailOffset, tailLength);
+  const endsWithNewline = tail.at(-1) === 0x0a;
+  const lastBoundary = endsWithNewline
+    ? tail.length - 1
+    : tail.lastIndexOf(0x0a);
+
+  if (endsWithNewline) {
+    validateCompleteAuditRecord(tail, lastBoundary, tailOffset);
+    return;
+  }
+
+  const fragmentStart = lastBoundary + 1;
+  const fragmentLength = tail.length - fragmentStart;
+  if (
+    fragmentLength <= 0 ||
+    fragmentLength > MAX_AUDIT_RECORD_BYTES ||
+    (lastBoundary < 0 && tailOffset > 0)
+  ) {
+    throw invalidAuditTail();
+  }
+  if (lastBoundary >= 0) {
+    validateCompleteAuditRecord(tail, lastBoundary, tailOffset);
+  }
+
+  const safeBoundary = tailOffset + fragmentStart;
+  try {
+    await handle.truncate(safeBoundary);
+    await handle.sync();
+  } catch (error) {
+    throw new Error('Unable to repair iCloud MCP audit file tail.', {
+      cause: error,
+    });
   }
 }
 
@@ -506,6 +666,19 @@ class DescriptorAuditFileHandle implements SecureAuditFileHandle {
     });
   }
 
+  read(
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number,
+  ): Promise<{ bytesRead: number }> {
+    return new Promise((resolveRead, rejectRead) => {
+      read(this.fd, buffer, offset, length, position, (error, bytesRead) =>
+        error === null ? resolveRead({ bytesRead }) : rejectRead(error),
+      );
+    });
+  }
+
   stat(): ReturnType<SecureAuditFileHandle['stat']> {
     return new Promise((resolveStat, rejectStat) => {
       fstat(this.fd, (error, stats) =>
@@ -581,7 +754,7 @@ async function openSecureAuditFile(
     directoryHandle,
     filename,
     constants.O_APPEND |
-      constants.O_WRONLY |
+      constants.O_RDWR |
       (created ? constants.O_CREAT | constants.O_EXCL : 0),
   );
   if (existing !== undefined) {
@@ -705,6 +878,8 @@ export class LocalAuditLog implements AuditLog {
               await this.#directorySync(directory.handle);
             }
             await directory.validate();
+            await validateAndRepairAuditTail(handle);
+            await validateAuditFile(handle, auditPath, expectedOwner);
             await appendAuditLine(handle, line);
             await validateAuditFile(handle, auditPath, expectedOwner);
             await directory.validate();

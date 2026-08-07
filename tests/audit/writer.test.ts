@@ -20,6 +20,7 @@ import { LocalAuditLog } from '../../src/audit';
 import {
   appendAuditLine,
   openSecureAuditDirectory,
+  validateAndRepairAuditTail,
   withAuditFileLock,
 } from '../../src/audit/writer';
 
@@ -41,6 +42,55 @@ function entry() {
     reason: 'ALLOW_POLICY' as const,
     tool: 'search_mail' as const,
     transport: 'http' as const,
+  };
+}
+
+function auditLine(eventId: string): string {
+  return `${JSON.stringify({
+    ...entry(),
+    eventId,
+    schemaVersion: 1,
+    timestamp: `${TEST_DATE}T00:00:00.000Z`,
+  })}\n`;
+}
+
+function memoryTailHandle(
+  initialContents: Uint8Array,
+  { failSync = false, failTruncate = false } = {},
+) {
+  let contents = Buffer.from(initialContents);
+  let syncCount = 0;
+  let truncateCount = 0;
+  return {
+    contents: () => contents,
+    handle: {
+      read: async (
+        buffer: Uint8Array,
+        offset: number,
+        length: number,
+        position: number,
+      ) => {
+        const source = contents.subarray(position, position + length);
+        buffer.set(source, offset);
+        return { bytesRead: source.length };
+      },
+      stat: async () => ({ size: contents.length }),
+      sync: async () => {
+        syncCount += 1;
+        if (failSync) {
+          throw new Error('synthetic sync failure');
+        }
+      },
+      truncate: async (length: number) => {
+        truncateCount += 1;
+        if (failTruncate) {
+          throw new Error('synthetic truncate failure');
+        }
+        contents = contents.subarray(0, length);
+      },
+    },
+    syncCount: () => syncCount,
+    truncateCount: () => truncateCount,
   };
 }
 
@@ -487,6 +537,104 @@ await withAuditFileLock(${JSON.stringify(lockPath)}, async () => {
     );
     expect(Buffer.byteLength(contents)).toBe(safeBoundary);
     expect(contents).toBe(completeRecord);
+  });
+
+  test('accepts empty and complete audit tails before a subsequent append', async () => {
+    for (const initialContents of ['', auditLine('prior-event')]) {
+      const directory = await makeAuditDirectory();
+      const auditPath = join(directory, `audit-${TEST_DATE}.jsonl`);
+      await writeFile(auditPath, initialContents, { mode: 0o600 });
+      const audit = new LocalAuditLog({
+        clock: () => new Date(`${TEST_DATE}T12:00:00.000Z`),
+        directory,
+        eventId: () => 'new-event',
+      });
+
+      await audit.append(entry());
+
+      const records = (await readFile(auditPath, 'utf8'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line));
+      expect(records.at(-1).eventId).toBe('new-event');
+      expect(records).toHaveLength(initialContents === '' ? 1 : 2);
+    }
+  });
+
+  test('repairs incomplete JSON and UTF-8 crash fragments before appending', async () => {
+    const fragments = [
+      Buffer.from('{"eventId":"partial', 'utf8'),
+      Buffer.from(auditLine('complete-but-missing-newline').slice(0, -1)),
+      Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0xf0, 0x9f]),
+    ];
+
+    for (const [index, fragment] of fragments.entries()) {
+      const directory = await makeAuditDirectory();
+      const auditPath = join(directory, `audit-${TEST_DATE}.jsonl`);
+      await writeFile(
+        auditPath,
+        Buffer.concat([Buffer.from(auditLine('prior-event')), fragment]),
+        { mode: 0o600 },
+      );
+      const audit = new LocalAuditLog({
+        clock: () => new Date(`${TEST_DATE}T12:00:00.000Z`),
+        directory,
+        eventId: () => `recovered-event-${index}`,
+      });
+
+      await audit.append(entry());
+
+      const lines = (await readFile(auditPath, 'utf8')).trim().split('\n');
+      expect(lines).toHaveLength(2);
+      expect(lines.map((line) => JSON.parse(line).eventId)).toEqual([
+        'prior-event',
+        `recovered-event-${index}`,
+      ]);
+    }
+  });
+
+  test('fails closed for a malformed complete audit record', async () => {
+    for (const malformedLine of ['{"bad":}\n', '{}\n']) {
+      const directory = await makeAuditDirectory();
+      const auditPath = join(directory, `audit-${TEST_DATE}.jsonl`);
+      const malformed = `${auditLine('prior-event')}${malformedLine}`;
+      await writeFile(auditPath, malformed, { mode: 0o600 });
+      const audit = new LocalAuditLog({
+        clock: () => new Date(`${TEST_DATE}T12:00:00.000Z`),
+        directory,
+        eventId: () => 'must-not-append',
+      });
+
+      await expect(audit.append(entry())).rejects.toThrow(
+        'Invalid iCloud MCP audit file tail.',
+      );
+      expect(await readFile(auditPath, 'utf8')).toBe(malformed);
+    }
+  });
+
+  test('fails closed when incomplete-tail truncate or sync repair fails', async () => {
+    const incomplete = Buffer.from(
+      `${auditLine('prior-event')}{"eventId":"partial`,
+    );
+    for (const failure of [{ failTruncate: true }, { failSync: true }]) {
+      const testHandle = memoryTailHandle(incomplete, failure);
+
+      await expect(
+        validateAndRepairAuditTail(testHandle.handle),
+      ).rejects.toThrow('Unable to repair iCloud MCP audit file tail.');
+      expect(testHandle.truncateCount()).toBe(1);
+      expect(testHandle.syncCount()).toBe(failure.failSync ? 1 : 0);
+    }
+  });
+
+  test('rejects an overlong audit fragment without attempting repair', async () => {
+    const testHandle = memoryTailHandle(Buffer.alloc(20_000, 0x78));
+
+    await expect(validateAndRepairAuditTail(testHandle.handle)).rejects.toThrow(
+      'Invalid iCloud MCP audit file tail.',
+    );
+    expect(testHandle.truncateCount()).toBe(0);
+    expect(testHandle.syncCount()).toBe(0);
   });
 
   test('refuses to append through a pre-existing audit-file symlink', async () => {

@@ -45,7 +45,11 @@ on findAccount(accountId)
   tell application "Mail"
     repeat with accountItem in accounts
       set currentId to my safeText(id of accountItem)
-      if currentId is not missing value and currentId is accountId then return accountItem
+      if currentId is not missing value then
+        considering case
+          if currentId is accountId then return accountItem
+        end considering
+      end if
     end repeat
   end tell
   return missing value
