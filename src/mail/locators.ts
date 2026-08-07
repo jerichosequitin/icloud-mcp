@@ -12,25 +12,45 @@ const ID_CHARACTER_LIMIT = 512;
 
 export interface FolderAddress {
   accountId: string;
-  mailboxId: string;
+  mailboxPath: readonly string[];
 }
 
 export interface MessageAddress extends FolderAddress {
   messageId: string;
 }
 
-function encodeLocator(kind: 'folder' | 'message', parts: readonly string[]) {
+function validText(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= ID_CHARACTER_LIMIT
+  );
+}
+
+function validMailboxPath(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((segment) => validText(segment))
+  );
+}
+
+function encodeLocator(kind: 'folder' | 'message', parts: readonly unknown[]) {
   const payload = Buffer.from(JSON.stringify(parts), 'utf8').toString(
     'base64url',
   );
-  return `${LOCATOR_PREFIX}.${kind}.${payload}`;
+  const locator = `${LOCATOR_PREFIX}.${kind}.${payload}`;
+  if (locator.length > MAIL_LIMITS.locatorCharacters) {
+    throw new MailAdapterError('INVALID_INPUT');
+  }
+  return locator;
 }
 
 function decodeLocator(
   locator: unknown,
   kind: 'folder' | 'message',
   partCount: number,
-): string[] {
+): unknown[] {
   if (
     typeof locator !== 'string' ||
     locator.length === 0 ||
@@ -50,16 +70,7 @@ function decodeLocator(
   try {
     const decoded = Buffer.from(payload, 'base64url').toString('utf8');
     const parts: unknown = JSON.parse(decoded);
-    if (
-      !Array.isArray(parts) ||
-      parts.length !== partCount ||
-      parts.some(
-        (part) =>
-          typeof part !== 'string' ||
-          part.length === 0 ||
-          part.length > ID_CHARACTER_LIMIT,
-      )
-    ) {
+    if (!Array.isArray(parts) || parts.length !== partCount) {
       throw new MailAdapterError('INVALID_INPUT');
     }
 
@@ -67,7 +78,7 @@ function decodeLocator(
       throw new MailAdapterError('INVALID_INPUT');
     }
 
-    return parts as string[];
+    return parts;
   } catch (error) {
     if (error instanceof MailAdapterError) {
       throw error;
@@ -77,39 +88,59 @@ function decodeLocator(
 }
 
 export function createFolderLocator(address: FolderAddress): MailFolderLocator {
+  if (!validText(address.accountId) || !validMailboxPath(address.mailboxPath)) {
+    throw new MailAdapterError('INVALID_INPUT');
+  }
   return encodeLocator('folder', [
     address.accountId,
-    address.mailboxId,
+    address.mailboxPath,
   ]) as MailFolderLocator;
 }
 
 export function createMessageLocator(
   address: MessageAddress,
 ): MailMessageLocator {
+  if (
+    !validText(address.accountId) ||
+    !validMailboxPath(address.mailboxPath) ||
+    !validText(address.messageId)
+  ) {
+    throw new MailAdapterError('INVALID_INPUT');
+  }
   return encodeLocator('message', [
     address.accountId,
-    address.mailboxId,
+    address.mailboxPath,
     address.messageId,
   ]) as MailMessageLocator;
 }
 
 export function parseFolderLocator(locator: unknown): FolderAddress {
-  const [accountId, mailboxId] = decodeLocator(locator, 'folder', 2);
+  const [accountId, mailboxPath] = decodeLocator(locator, 'folder', 2);
+  if (!validText(accountId) || !validMailboxPath(mailboxPath)) {
+    throw new MailAdapterError('INVALID_INPUT');
+  }
   return {
-    accountId: accountId!,
-    mailboxId: mailboxId!,
+    accountId,
+    mailboxPath,
   };
 }
 
 export function parseMessageLocator(locator: unknown): MessageAddress {
-  const [accountId, mailboxId, messageId] = decodeLocator(
+  const [accountId, mailboxPath, messageId] = decodeLocator(
     locator,
     'message',
     3,
   );
+  if (
+    !validText(accountId) ||
+    !validMailboxPath(mailboxPath) ||
+    !validText(messageId)
+  ) {
+    throw new MailAdapterError('INVALID_INPUT');
+  }
   return {
-    accountId: accountId!,
-    mailboxId: mailboxId!,
-    messageId: messageId!,
+    accountId,
+    mailboxPath,
+    messageId,
   };
 }

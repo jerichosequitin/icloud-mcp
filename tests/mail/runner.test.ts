@@ -6,7 +6,7 @@ import {
   type MailProcessSpawner,
 } from '../../src/mail/runner';
 import { getMailScript } from '../../src/mail/scripts';
-import type { MailOperation } from '../../src/mail/types';
+import { MAIL_LIMITS, type MailOperation } from '../../src/mail/types';
 
 function streamFromText(text: string): ReadableStream<Uint8Array> {
   return new ReadableStream({
@@ -87,6 +87,13 @@ describe('fixed AppleScript runner', () => {
       expect(script).not.toContain('do shell script');
       expect(script).not.toMatch(/\b(delete|move|send)\b/i);
     }
+    expect(getMailScript('listFolders')).not.toContain('id of mailboxItem');
+  });
+
+  test('stdout limit covers worst-case escaped body output', () => {
+    expect(MAIL_LIMITS.stdoutBytes).toBeGreaterThan(
+      MAIL_LIMITS.bodyMessages * MAIL_LIMITS.bodyCharacters * 6,
+    );
   });
 
   test('does not spawn a process for an unsupported operation', async () => {

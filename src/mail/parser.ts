@@ -46,10 +46,18 @@ function stringArray(value: unknown): string[] {
   return value as string[];
 }
 
+function requiredStringArray(value: unknown): string[] {
+  const result = stringArray(value);
+  if (result.length === 0 || result.some((item) => item.length === 0)) {
+    throw new MailAdapterError('MALFORMED_RESPONSE');
+  }
+  return result;
+}
+
 export interface FolderRow {
   accountId: string;
   accountName: string | null;
-  mailboxId: string;
+  mailboxPath: string[];
   name: string | null;
 }
 
@@ -63,7 +71,7 @@ export function parseFolderRows(
     }
     return {
       accountId: requiredString(row[0]),
-      mailboxId: requiredString(row[1]),
+      mailboxPath: requiredStringArray(row[1]),
       name: nullableString(row[2]),
       accountName: nullableString(row[3]),
     };
@@ -72,30 +80,56 @@ export function parseFolderRows(
 
 export interface SearchRow {
   accountId: string;
-  mailboxId: string;
+  mailboxPath: string[];
   messageId: string;
   receivedDate: string | null;
   sender: string | null;
   subject: string | null;
 }
 
-export function parseSearchRows(
+export interface SearchResponse {
+  rows: SearchRow[];
+  scanTruncated: boolean;
+}
+
+export function parseSearchResponse(
   output: string,
   resultLimit: number,
-): SearchRow[] {
-  return parseRows(output, resultLimit).map((row) => {
-    if (row.length !== 6) {
-      throw new MailAdapterError('MALFORMED_RESPONSE');
-    }
-    return {
-      accountId: requiredString(row[0]),
-      mailboxId: requiredString(row[1]),
-      messageId: requiredString(row[2]),
-      subject: nullableString(row[3]),
-      sender: nullableString(row[4]),
-      receivedDate: nullableString(row[5]),
-    };
-  });
+): SearchResponse {
+  let response: unknown;
+  try {
+    response = JSON.parse(output);
+  } catch {
+    throw new MailAdapterError('MALFORMED_RESPONSE');
+  }
+  if (
+    !Array.isArray(response) ||
+    response.length !== 2 ||
+    !Array.isArray(response[0]) ||
+    typeof response[1] !== 'boolean'
+  ) {
+    throw new MailAdapterError('MALFORMED_RESPONSE');
+  }
+  const rows = response[0];
+  if (rows.length > resultLimit || rows.some((row) => !Array.isArray(row))) {
+    throw new MailAdapterError('MALFORMED_RESPONSE');
+  }
+  return {
+    rows: (rows as JsonRow[]).map((row) => {
+      if (row.length !== 6) {
+        throw new MailAdapterError('MALFORMED_RESPONSE');
+      }
+      return {
+        accountId: requiredString(row[0]),
+        mailboxPath: requiredStringArray(row[1]),
+        messageId: requiredString(row[2]),
+        subject: nullableString(row[3]),
+        sender: nullableString(row[4]),
+        receivedDate: nullableString(row[5]),
+      };
+    }),
+    scanTruncated: response[1],
+  };
 }
 
 export interface MetadataRow {

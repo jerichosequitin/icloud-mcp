@@ -9,7 +9,7 @@ import {
   parseBodyRows,
   parseFolderRows,
   parseMetadataRows,
-  parseSearchRows,
+  parseSearchResponse,
 } from './parser';
 import {
   AppleScriptMailRunner,
@@ -89,7 +89,11 @@ function flattenMessageAddresses(
 ): string[] {
   return locators.flatMap((locator) => {
     const address = parseMessageLocator(locator);
-    return [address.accountId, address.mailboxId, address.messageId];
+    return [
+      address.accountId,
+      JSON.stringify(address.mailboxPath),
+      address.messageId,
+    ];
   });
 }
 
@@ -171,28 +175,28 @@ export class AppleMailAdapter {
     }
     const folder = parseFolderLocator(values.folder);
     const limit = optionalLimit(values.limit, 25, MAIL_LIMITS.searchResults);
-    const rows = await this.#run(
+    const response = await this.#run(
       {
         operation: 'searchMail',
         arguments: [
           folder.accountId,
-          folder.mailboxId,
+          JSON.stringify(folder.mailboxPath),
           values.query,
           values.field,
           String(MAIL_LIMITS.searchScanMessages),
           String(limit),
         ],
       },
-      (output) => parseSearchRows(output, limit),
+      (output) => parseSearchResponse(output, limit),
     );
     return {
-      messages: rows.map((row) => ({
+      messages: response.rows.map((row) => ({
         locator: createMessageLocator(row),
         subject: row.subject,
         sender: row.sender,
         receivedDate: row.receivedDate,
       })),
-      truncated: rows.length === limit,
+      truncated: response.rows.length === limit || response.scanTruncated,
     };
   }
 

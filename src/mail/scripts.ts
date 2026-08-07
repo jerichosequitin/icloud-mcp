@@ -27,6 +27,20 @@ on encodeJson(valueToEncode)
   return (current application's NSString's alloc()'s initWithData:jsonData encoding:(current application's NSUTF8StringEncoding)) as text
 end encodeJson
 
+on decodeTextArray(valueToDecode)
+  set jsonText to current application's NSString's stringWithString:valueToDecode
+  set jsonData to jsonText's dataUsingEncoding:(current application's NSUTF8StringEncoding)
+  set decodedValue to current application's NSJSONSerialization's JSONObjectWithData:jsonData options:0 |error|:(missing value)
+  if decodedValue is missing value then error number -1708
+  try
+    set decodedItems to decodedValue as list
+  on error
+    error number -1708
+  end try
+  if (count decodedItems) is 0 then error number -1708
+  return decodedItems
+end decodeTextArray
+
 on findAccount(accountId)
   tell application "Mail"
     repeat with accountItem in accounts
@@ -37,15 +51,24 @@ on findAccount(accountId)
   return missing value
 end findAccount
 
-on findMailbox(containerItem, mailboxId)
-  tell application "Mail" to set childMailboxes to mailboxes of containerItem
-  repeat with mailboxItem in childMailboxes
-    tell application "Mail" to set currentId to my safeText(id of mailboxItem)
-    if currentId is not missing value and currentId is mailboxId then return mailboxItem
-    set nestedMailbox to my findMailbox(mailboxItem, mailboxId)
-    if nestedMailbox is not missing value then return nestedMailbox
+on findMailbox(containerItem, mailboxPathJson)
+  set mailboxPath to my decodeTextArray(mailboxPathJson)
+  set currentContainer to containerItem
+  repeat with mailboxNameReference in mailboxPath
+    set mailboxName to mailboxNameReference as text
+    tell application "Mail" to set childMailboxes to mailboxes of currentContainer
+    set matchingMailbox to missing value
+    repeat with mailboxItem in childMailboxes
+      tell application "Mail" to set candidateName to my safeText(name of mailboxItem)
+      if candidateName is not missing value and candidateName is mailboxName then
+        set matchingMailbox to mailboxItem
+        exit repeat
+      end if
+    end repeat
+    if matchingMailbox is missing value then return missing value
+    set currentContainer to matchingMailbox
   end repeat
-  return missing value
+  return currentContainer
 end findMailbox
 
 on findMessage(mailboxItem, messageId)
@@ -61,22 +84,20 @@ end findMessage
 `;
 
 const LIST_FOLDERS_SCRIPT = `${JSON_HELPERS}
-on collectFolders(containerItem, accountId, accountName, resultLimit)
+on collectFolders(containerItem, accountId, accountName, parentPath, resultLimit)
   set folderRows to {}
   tell application "Mail" to set childMailboxes to mailboxes of containerItem
   repeat with mailboxItem in childMailboxes
     if (count folderRows) is greater than or equal to resultLimit then exit repeat
-    tell application "Mail"
-      set mailboxId to my safeText(id of mailboxItem)
-      set mailboxName to my safeText(name of mailboxItem)
-    end tell
-    if mailboxId is not missing value then
-      set end of folderRows to {accountId, mailboxId, my jsonValue(mailboxName), my jsonValue(accountName)}
-    end if
-    set remainingCount to resultLimit - (count folderRows)
-    if remainingCount is greater than 0 then
-      set nestedRows to my collectFolders(mailboxItem, accountId, accountName, remainingCount)
-      set folderRows to folderRows & nestedRows
+    tell application "Mail" to set mailboxName to my safeText(name of mailboxItem)
+    if mailboxName is not missing value then
+      set mailboxPath to parentPath & {mailboxName}
+      set end of folderRows to {accountId, mailboxPath, mailboxName, my jsonValue(accountName)}
+      set remainingCount to resultLimit - (count folderRows)
+      if remainingCount is greater than 0 then
+        set nestedRows to my collectFolders(mailboxItem, accountId, accountName, mailboxPath, remainingCount)
+        set folderRows to folderRows & nestedRows
+      end if
     end if
   end repeat
   return folderRows
@@ -93,7 +114,7 @@ on run argv
       set accountName to my safeText(name of accountItem)
       if accountId is not missing value then
         set remainingCount to resultLimit - (count folderRows)
-        set accountRows to my collectFolders(accountItem, accountId, accountName, remainingCount)
+        set accountRows to my collectFolders(accountItem, accountId, accountName, {}, remainingCount)
         set folderRows to folderRows & accountRows
       end if
     end repeat
@@ -138,7 +159,7 @@ end messageMatches
 on run argv
   if (count argv) is not 6 then error number -1708
   set accountId to item 1 of argv
-  set mailboxId to item 2 of argv
+  set mailboxPathJson to item 2 of argv
   set queryText to item 3 of argv
   set fieldName to item 4 of argv
   set scanLimit to item 5 of argv as integer
@@ -146,13 +167,15 @@ on run argv
   if fieldName is not "recipient" and fieldName is not "sender" and fieldName is not "subject" then error number -1708
 
   set accountItem to my findAccount(accountId)
-  if accountItem is missing value then return my encodeJson({})
-  set mailboxItem to my findMailbox(accountItem, mailboxId)
-  if mailboxItem is missing value then return my encodeJson({})
+  if accountItem is missing value then return my encodeJson({{}, false})
+  set mailboxItem to my findMailbox(accountItem, mailboxPathJson)
+  if mailboxItem is missing value then return my encodeJson({{}, false})
+  set mailboxPath to my decodeTextArray(mailboxPathJson)
 
   set messageRows to {}
   set scannedCount to 0
   tell application "Mail" to set candidateMessages to messages of mailboxItem
+  set candidateCount to count candidateMessages
   repeat with messageItem in candidateMessages
     if scannedCount is greater than or equal to scanLimit then exit repeat
     if (count messageRows) is greater than or equal to resultLimit then exit repeat
@@ -165,11 +188,12 @@ on run argv
         set receivedDate to my safeText(date received of messageItem)
       end tell
       if messageId is not missing value then
-        set end of messageRows to {accountId, mailboxId, messageId, my jsonValue(messageSubject), my jsonValue(messageSender), my jsonValue(receivedDate)}
+        set end of messageRows to {accountId, mailboxPath, messageId, my jsonValue(messageSubject), my jsonValue(messageSender), my jsonValue(receivedDate)}
       end if
     end if
   end repeat
-  return my encodeJson(messageRows)
+  set scanTruncated to ((scannedCount is greater than or equal to scanLimit) and (candidateCount is greater than scannedCount))
+  return my encodeJson({messageRows, scanTruncated})
 end run
 `;
 
@@ -185,10 +209,10 @@ on recipientAddresses(recipientItems)
   return addresses
 end recipientAddresses
 
-on metadataRow(accountId, mailboxId, messageId)
+on metadataRow(accountId, mailboxPathJson, messageId)
   set accountItem to my findAccount(accountId)
   if accountItem is missing value then return {false}
-  set mailboxItem to my findMailbox(accountItem, mailboxId)
+  set mailboxItem to my findMailbox(accountItem, mailboxPathJson)
   if mailboxItem is missing value then return {false}
   set messageItem to my findMessage(mailboxItem, messageId)
   if messageItem is missing value then return {false}
@@ -234,10 +258,10 @@ end run
 `;
 
 const GET_MESSAGE_BODIES_SCRIPT = `${JSON_HELPERS}
-on bodyRow(accountId, mailboxId, messageId, characterLimit)
+on bodyRow(accountId, mailboxPathJson, messageId, characterLimit)
   set accountItem to my findAccount(accountId)
   if accountItem is missing value then return {false}
-  set mailboxItem to my findMailbox(accountItem, mailboxId)
+  set mailboxItem to my findMailbox(accountItem, mailboxPathJson)
   if mailboxItem is missing value then return {false}
   set messageItem to my findMessage(mailboxItem, messageId)
   if messageItem is missing value then return {false}

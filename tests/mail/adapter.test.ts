@@ -30,16 +30,16 @@ class FakeRunner implements MailScriptRunner {
 
 const folder = createFolderLocator({
   accountId: 'account-1',
-  mailboxId: 'mailbox-1',
+  mailboxPath: ['Archive', '2026'],
 });
 const message = createMessageLocator({
   accountId: 'account-1',
-  mailboxId: 'mailbox-1',
+  mailboxPath: ['Archive', '2026'],
   messageId: '42',
 });
 const missingMessage = createMessageLocator({
   accountId: 'account-1',
-  mailboxId: 'mailbox-1',
+  mailboxPath: ['Archive', '2026'],
   messageId: '404',
 });
 
@@ -60,8 +60,8 @@ describe('AppleMailAdapter', () => {
   test('lists concise folders with opaque locators', async () => {
     const runner = new FakeRunner(
       JSON.stringify([
-        ['account-1', 'mailbox-1', 'Inbox', 'iCloud'],
-        ['account-1', 'mailbox-2', null, null],
+        ['account-1', ['Inbox'], 'Inbox', 'iCloud'],
+        ['account-1', ['Archive', '2026'], '2026', null],
       ]),
     );
     const adapter = new AppleMailAdapter(runner);
@@ -70,14 +70,21 @@ describe('AppleMailAdapter', () => {
 
     expect(result).toEqual({
       folders: [
-        { accountName: 'iCloud', locator: folder, name: 'Inbox' },
+        {
+          accountName: 'iCloud',
+          locator: createFolderLocator({
+            accountId: 'account-1',
+            mailboxPath: ['Inbox'],
+          }),
+          name: 'Inbox',
+        },
         {
           accountName: null,
           locator: createFolderLocator({
             accountId: 'account-1',
-            mailboxId: 'mailbox-2',
+            mailboxPath: ['Archive', '2026'],
           }),
-          name: null,
+          name: '2026',
         },
       ],
       truncated: true,
@@ -92,13 +99,16 @@ describe('AppleMailAdapter', () => {
     const runner = new FakeRunner(
       JSON.stringify([
         [
-          'account-1',
-          'mailbox-1',
-          '42',
-          'Synthetic subject',
-          null,
-          'Friday, 7 August 2026 at 10:00:00',
+          [
+            'account-1',
+            ['Archive', '2026'],
+            '42',
+            'Synthetic subject',
+            null,
+            'Friday, 7 August 2026 at 10:00:00',
+          ],
         ],
+        false,
       ]),
     );
     const adapter = new AppleMailAdapter(runner);
@@ -114,7 +124,7 @@ describe('AppleMailAdapter', () => {
       operation: 'searchMail',
       arguments: [
         'account-1',
-        'mailbox-1',
+        '["Archive","2026"]',
         query,
         'subject',
         String(MAIL_LIMITS.searchScanMessages),
@@ -199,19 +209,19 @@ describe('AppleMailAdapter', () => {
     });
     expect(runner.invocations[0]?.arguments).toEqual([
       'account-1',
-      'mailbox-1',
+      '["Archive","2026"]',
       '42',
       'account-1',
-      'mailbox-1',
+      '["Archive","2026"]',
       '404',
     ]);
     expect(runner.invocations[1]?.arguments).toEqual([
       '1000',
       'account-1',
-      'mailbox-1',
+      '["Archive","2026"]',
       '42',
       'account-1',
-      'mailbox-1',
+      '["Archive","2026"]',
       '404',
     ]);
   });
@@ -277,7 +287,26 @@ describe('AppleMailAdapter', () => {
       adapter.listFolders({ limit: MAIL_LIMITS.folders + 1 }),
       'INVALID_INPUT',
     );
+    expect(() =>
+      createMessageLocator({
+        accountId: 'account-1',
+        mailboxPath: Array.from({ length: 5 }, () => 'x'.repeat(512)),
+        messageId: '42',
+      }),
+    ).toThrow(MailAdapterError);
     expect(runner.invocations).toHaveLength(0);
+  });
+
+  test('reports truncation when the bounded mailbox scan is exhausted', async () => {
+    const adapter = new AppleMailAdapter(new FakeRunner('[[],true]'));
+
+    await expect(
+      adapter.searchMail({
+        field: 'subject',
+        folder,
+        query: 'not found in first 500',
+      }),
+    ).resolves.toEqual({ messages: [], truncated: true });
   });
 
   test('sanitizes malformed output and process failures', async () => {
@@ -306,8 +335,11 @@ describe('AppleMailAdapter', () => {
   test('rejects parser output above the requested result count', async () => {
     const runner = new FakeRunner(
       JSON.stringify([
-        ['account-1', 'mailbox-1', 'one', null, null, null],
-        ['account-1', 'mailbox-1', 'two', null, null, null],
+        [
+          ['account-1', ['Inbox'], 'one', null, null, null],
+          ['account-1', ['Inbox'], 'two', null, null, null],
+        ],
+        false,
       ]),
     );
     const adapter = new AppleMailAdapter(runner);

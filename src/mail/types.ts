@@ -9,7 +9,7 @@ export const MAIL_LIMITS = {
   searchResults: 50,
   searchScanMessages: 500,
   stderrBytes: 16_384,
-  stdoutBytes: 1_500_000,
+  stdoutBytes: 3_100_000,
 } as const;
 
 declare const folderLocatorBrand: unique symbol;
