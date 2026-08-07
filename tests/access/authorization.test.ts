@@ -62,7 +62,10 @@ async function withClient<Result>(
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
-  const client = new Client({ name: 'untrusted-client', version: '9.9.9' });
+  const client = new Client({
+    name: 'Bearer secret query locator',
+    version: 'message-body-fragment',
+  });
   await client.connect(clientTransport);
   try {
     return await run(client);
@@ -160,12 +163,10 @@ describe('Mail access authorization', () => {
         decision: 'allow',
         reason: 'ALLOW_POLICY',
         tool: 'list_folders',
-        untrustedMcpClient: {
-          name: 'untrusted-client',
-          version: '9.9.9',
-        },
       }),
     ]);
+    expect(audit.entries[0]).not.toHaveProperty('untrustedMcpClient');
+    expect(JSON.stringify(audit.entries)).not.toContain('Bearer secret');
   });
 
   test('denies folder and mixed-message access atomically before execution', async () => {

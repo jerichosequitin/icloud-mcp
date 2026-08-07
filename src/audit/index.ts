@@ -4,7 +4,6 @@ export {
   type AuditEntry,
   type AuditEntryInput,
   type AuditReasonCode,
-  type UntrustedMcpClient,
 } from './schema';
 export {
   DEFAULT_AUDIT_RETENTION_FILES,

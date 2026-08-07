@@ -129,9 +129,11 @@ describe('Streamable HTTP transport', () => {
         clientId: 'test-http',
         protocolEra: 'modern',
         transport: 'http',
-        untrustedMcpClient: { name: 'http-modern', version: '1.0.0' },
       }),
     ]);
+    expect(audit.entries).toSatisfy((entries) =>
+      entries.every((entry) => !('untrustedMcpClient' in entry)),
+    );
   });
 
   test('returns one fixed Bearer 401 before dispatch for missing or invalid authentication in both eras', async () => {

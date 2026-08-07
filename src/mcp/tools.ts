@@ -16,12 +16,7 @@ import {
   type MailToolName,
   type ProtocolEra,
 } from '../access';
-import type {
-  AuditEntryInput,
-  AuditLog,
-  AuditReasonCode,
-  UntrustedMcpClient,
-} from '../audit';
+import type { AuditEntryInput, AuditLog, AuditReasonCode } from '../audit';
 import type { AppleMailAdapter } from '../mail/adapter';
 import { MailAdapterError, type MailAdapterErrorCode } from '../mail/errors';
 import { parseFolderLocator, parseMessageLocator } from '../mail/locators';
@@ -149,25 +144,12 @@ function errorResult(error: unknown): CallToolResult {
   );
 }
 
-function untrustedClient(server: Server): UntrustedMcpClient | undefined {
-  const reported = server.getClientVersion();
-  if (reported === undefined) {
-    return undefined;
-  }
-  return {
-    name: reported.name.slice(0, 200),
-    version: reported.version.slice(0, 200),
-  };
-}
-
 function auditInput(
-  server: Server,
   options: RegisterMailToolsOptions,
   tool: MailToolName,
   decision: 'allow' | 'deny',
   reason: AuditReasonCode,
 ): AuditEntryInput {
-  const reportedClient = untrustedClient(server);
   return {
     clientId: options.principal.client.id,
     decision,
@@ -175,9 +157,6 @@ function auditInput(
     reason,
     tool,
     transport: options.principal.transport,
-    ...(reportedClient === undefined
-      ? {}
-      : { untrustedMcpClient: reportedClient }),
   };
 }
 
@@ -188,9 +167,7 @@ async function deny(
   reason: AuditReasonCode,
 ): Promise<CallToolResult> {
   try {
-    await options.audit.append(
-      auditInput(server, options, tool, 'deny', reason),
-    );
+    await options.audit.append(auditInput(options, tool, 'deny', reason));
   } catch {
     try {
       options.diagnostics('iCloud MCP denial audit append failed.');
@@ -210,7 +187,7 @@ async function callAdapter<Result>(
 ): Promise<CallToolResult> {
   try {
     await options.audit.append(
-      auditInput(server, options, tool, 'allow', 'ALLOW_POLICY'),
+      auditInput(options, tool, 'allow', 'ALLOW_POLICY'),
     );
     const parsed = outputSchema.safeParse(await operation());
     if (!parsed.success) {

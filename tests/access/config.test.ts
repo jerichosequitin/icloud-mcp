@@ -148,6 +148,23 @@ describe('access policy configuration', () => {
     expect(loaded.httpCredentials).toEqual([]);
   });
 
+  test('rejects bearer tokens outside the transport-safe token syntax', async () => {
+    for (const token of [
+      'contains space',
+      'unicode-🔒',
+      'header:value',
+      'padding=inside',
+    ]) {
+      const path = await writePolicy(validPolicy());
+      await expect(
+        loadAccessPolicy(path, {
+          environment: { REMOTE_TOKEN: token },
+          transport: 'http',
+        }),
+      ).rejects.toThrow('Invalid iCloud MCP access policy.');
+    }
+  });
+
   test('rejects policy files or parent directories writable by other users', async () => {
     const groupWritableFile = await writePolicy(validPolicy());
     await chmod(groupWritableFile, 0o660);

@@ -15,11 +15,6 @@ export const AUDIT_REASON_CODES = [
 
 export type AuditReasonCode = (typeof AUDIT_REASON_CODES)[number];
 
-export interface UntrustedMcpClient {
-  name: string;
-  version: string;
-}
-
 export interface AuditEntry {
   clientId: string;
   decision: 'allow' | 'deny';
@@ -30,7 +25,6 @@ export interface AuditEntry {
   timestamp: string;
   tool: MailToolName;
   transport: AccessTransport;
-  untrustedMcpClient?: UntrustedMcpClient;
 }
 
 export type AuditEntryInput = Omit<

@@ -17,6 +17,7 @@ import {
 
 const CLIENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const ENV_NAME_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
+const BEARER_TOKEN_PATTERN = /^[A-Za-z0-9._~+/-]+=*$/;
 const MAX_TOKEN_CHARACTERS = 4_096;
 
 const mailScopeSchema = z.union([
@@ -82,8 +83,7 @@ function validToken(token: string | undefined): token is string {
     token !== undefined &&
     token.length > 0 &&
     token.length <= MAX_TOKEN_CHARACTERS &&
-    token.trim() === token &&
-    !/\s/.test(token)
+    BEARER_TOKEN_PATTERN.test(token)
   );
 }
 

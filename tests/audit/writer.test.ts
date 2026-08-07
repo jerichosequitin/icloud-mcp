@@ -23,7 +23,6 @@ function entry() {
     reason: 'ALLOW_POLICY' as const,
     tool: 'search_mail' as const,
     transport: 'http' as const,
-    untrustedMcpClient: { name: 'test-client', version: '1.0.0' },
   };
 }
 
@@ -107,6 +106,25 @@ describe('local audit log', () => {
     await audit.append(entry());
     expect(diagnostics).toEqual(['iCloud MCP audit retention cleanup failed.']);
     expect(diagnostics.join('')).not.toContain(directory);
+  });
+
+  test('preserves the active audit file when future-dated files exist', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'icloud-audit-'));
+    for (const date of ['2027-01-01', '2027-01-02']) {
+      await writeFile(join(directory, `audit-${date}.jsonl`), '{}\n');
+    }
+    const audit = new LocalAuditLog({
+      clock: () => new Date('2026-08-07T12:00:00.000Z'),
+      directory,
+      retentionFiles: 2,
+    });
+
+    await audit.append(entry());
+
+    expect((await readdir(directory)).sort()).toEqual([
+      'audit-2026-08-07.jsonl',
+      'audit-2027-01-02.jsonl',
+    ]);
   });
 
   test('retries retention cleanup after a transient failure', async () => {

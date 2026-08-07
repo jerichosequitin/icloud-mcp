@@ -92,6 +92,7 @@ export class LocalAuditLog implements AuditLog {
     const now = this.#clock();
     const timestamp = now.toISOString();
     const date = timestamp.slice(0, 10);
+    const activeFilename = `audit-${date}.jsonl`;
     const entry: AuditEntry = {
       ...input,
       eventId: this.#eventId(),
@@ -106,7 +107,7 @@ export class LocalAuditLog implements AuditLog {
     }
     await chmod(this.#directory, 0o700);
     const handle = await open(
-      join(this.#directory, `audit-${date}.jsonl`),
+      join(this.#directory, activeFilename),
       constants.O_APPEND |
         constants.O_CREAT |
         constants.O_NOFOLLOW |
@@ -125,7 +126,7 @@ export class LocalAuditLog implements AuditLog {
 
     if (this.#lastCleanupDate !== date) {
       try {
-        await this.cleanup();
+        await this.cleanup(activeFilename);
         this.#lastCleanupDate = date;
       } catch {
         this.#diagnostics('iCloud MCP audit retention cleanup failed.');
@@ -133,7 +134,7 @@ export class LocalAuditLog implements AuditLog {
     }
   }
 
-  protected async cleanup(): Promise<void> {
+  protected async cleanup(activeFilename: string): Promise<void> {
     const entries = await readdir(this.#directory, { withFileTypes: true });
     const auditFiles = entries
       .filter(
@@ -142,7 +143,10 @@ export class LocalAuditLog implements AuditLog {
       .map(({ name }) => name)
       .sort()
       .reverse();
-    for (const filename of auditFiles.slice(this.#retentionFiles)) {
+    const inactiveFiles = auditFiles.filter(
+      (filename) => filename !== activeFilename,
+    );
+    for (const filename of inactiveFiles.slice(this.#retentionFiles - 1)) {
       await unlink(join(this.#directory, filename));
     }
   }
