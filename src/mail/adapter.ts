@@ -168,6 +168,7 @@ export class AppleMailAdapter {
       typeof values.query !== 'string' ||
       values.query.trim().length === 0 ||
       values.query.length > MAIL_LIMITS.queryCharacters ||
+      values.query.includes('\0') ||
       typeof values.field !== 'string' ||
       !['recipient', 'sender', 'subject'].includes(values.field)
     ) {

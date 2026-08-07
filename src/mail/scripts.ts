@@ -60,9 +60,13 @@ on findMailbox(containerItem, mailboxPathJson)
     set matchingMailbox to missing value
     repeat with mailboxItem in childMailboxes
       tell application "Mail" to set candidateName to my safeText(name of mailboxItem)
-      if candidateName is not missing value and candidateName is mailboxName then
-        set matchingMailbox to mailboxItem
-        exit repeat
+      if candidateName is not missing value then
+        considering case
+          if candidateName is mailboxName then
+            set matchingMailbox to mailboxItem
+            exit repeat
+          end if
+        end considering
       end if
     end repeat
     if matchingMailbox is missing value then return missing value
@@ -174,8 +178,13 @@ on run argv
 
   set messageRows to {}
   set scannedCount to 0
-  tell application "Mail" to set candidateMessages to messages of mailboxItem
-  set candidateCount to count candidateMessages
+  tell application "Mail" to set candidateCount to count messages of mailboxItem
+  set boundedCount to candidateCount
+  if boundedCount is greater than scanLimit then set boundedCount to scanLimit
+  set candidateMessages to {}
+  if boundedCount is greater than 0 then
+    tell application "Mail" to set candidateMessages to items 1 thru boundedCount of messages of mailboxItem
+  end if
   repeat with messageItem in candidateMessages
     if scannedCount is greater than or equal to scanLimit then exit repeat
     if (count messageRows) is greater than or equal to resultLimit then exit repeat

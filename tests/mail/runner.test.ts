@@ -88,6 +88,10 @@ describe('fixed AppleScript runner', () => {
       expect(script).not.toMatch(/\b(delete|move|send)\b/i);
     }
     expect(getMailScript('listFolders')).not.toContain('id of mailboxItem');
+    expect(getMailScript('searchMail')).toContain('considering case');
+    expect(getMailScript('searchMail')).toContain(
+      'items 1 thru boundedCount of messages',
+    );
   });
 
   test('stdout limit covers worst-case escaped body output', () => {
@@ -111,6 +115,28 @@ describe('fixed AppleScript runner', () => {
     } catch (error) {
       expect(error).toBeInstanceOf(MailAdapterError);
       expect((error as MailAdapterError).code).toBe('UNSUPPORTED_OPERATION');
+    }
+    expect(spawnCount).toBe(0);
+  });
+
+  test('does not spawn a process for arguments containing NUL', async () => {
+    let spawnCount = 0;
+    const runner = new AppleScriptMailRunner({
+      spawn: () => {
+        spawnCount += 1;
+        throw new Error('must not execute');
+      },
+    });
+
+    try {
+      await runner.run({
+        arguments: ['\0synthetic'],
+        operation: 'listFolders',
+      });
+      throw new Error('Expected the invalid argument to fail.');
+    } catch (error) {
+      expect(error).toBeInstanceOf(MailAdapterError);
+      expect((error as MailAdapterError).code).toBe('INVALID_INPUT');
     }
     expect(spawnCount).toBe(0);
   });

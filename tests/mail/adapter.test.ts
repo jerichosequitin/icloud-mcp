@@ -275,6 +275,14 @@ describe('AppleMailAdapter', () => {
       'INVALID_INPUT',
     );
     await expectAdapterError(
+      adapter.searchMail({
+        field: 'subject',
+        folder,
+        query: '\0synthetic',
+      }),
+      'INVALID_INPUT',
+    );
+    await expectAdapterError(
       adapter.getMessageBodies({
         locators: Array.from(
           { length: MAIL_LIMITS.bodyMessages + 1 },

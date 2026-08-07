@@ -1,4 +1,4 @@
-import { MailRunnerError } from './errors';
+import { MailAdapterError, MailRunnerError } from './errors';
 import { getMailScript } from './scripts';
 import { MAIL_LIMITS, type MailOperation } from './types';
 
@@ -92,6 +92,9 @@ export class AppleScriptMailRunner implements MailScriptRunner {
 
   async run(invocation: MailScriptInvocation): Promise<string> {
     const script = getMailScript(invocation.operation);
+    if (invocation.arguments.some((argument) => argument.includes('\0'))) {
+      throw new MailAdapterError('INVALID_INPUT');
+    }
     let process: SpawnedProcess;
     try {
       process = this.#spawn([
