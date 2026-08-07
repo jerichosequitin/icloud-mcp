@@ -2,7 +2,20 @@
 
 An open-source project for a local iCloud Mail MCP integration.
 
-The repository currently contains only contribution and quality foundations. Product implementation, Apple Mail access, MCP transports, authentication, tunnels, and remote connectivity are intentionally deferred to separately scoped work.
+The current implementation includes a local, read-only Apple Mail adapter. MCP transports, tool registration, authentication, tunnels, and remote connectivity are intentionally deferred to separately scoped work.
+
+## Read-only Mail adapter
+
+`src/mail/index.ts` exports a typed adapter with exactly four operations:
+
+- `listFolders` returns concise account and mailbox names with opaque folder locators;
+- `searchMail` searches one selected folder by subject, sender, or recipient and returns concise metadata;
+- `getMessageMetadata` returns headers and Mail status for explicitly selected message locators;
+- `getMessageBodies` returns body content only for explicitly selected message locators.
+
+Searches scan at most 500 messages and return at most 50 results. Folder, metadata, body, query, output-size, and execution-time limits are also enforced by the adapter. Missing Apple Mail fields are represented as `null`, while missing message locators are returned separately from successful results.
+
+The adapter selects fixed AppleScript source for each operation, invokes `/usr/bin/osascript` directly without a shell, and passes all caller input through `on run argv`. It exposes no Mail write operation and does not accept script source, script paths, shell fragments, or raw AppleScript predicates. Tests use a fake runner and synthetic data; no personal Mail data is stored or emitted by the test suite.
 
 ## Requirements
 
