@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "clients": [
+    {
+      "id": "chatgpt-web",
+      "transport": "stdio",
+      "tools": ["list_folders", "search_mail", "get_message_metadata"],
+      "mailScope": {
+        "folders": [
+          "icloud-mail-v1.folder.WyJzeW50aGV0aWMtYWNjb3VudCIsWyJJbmJveCJdXQ"
+        ]
+      },
+      "allowBodies": false
+    }
+  ]
+}

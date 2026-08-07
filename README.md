@@ -28,6 +28,8 @@ The server discovers exactly four read-only tools:
 
 Only `get_message_bodies` returns message body content. Every successful call returns the validated structured result plus one JSON text block containing the same result for compatibility.
 
+For private ChatGPT Web access, follow the [Secure MCP Tunnel connector guide](docs/connectors/chatgpt-secure-tunnel.md).
+
 ## Access policy
 
 Set `ICLOUD_MCP_POLICY_PATH` to an absolute path for a versioned JSON policy stored outside this repository. The policy file and its parent directory must be owned by the current user; the file must have no group or world permissions, and the parent directory must not be group- or world-writable. The server refuses to start for a missing, relative, repository-local, malformed, or insecure policy. Copy [policy.example.json](policy.example.json) to a private configuration directory, set the file mode to `0600`, and replace the synthetic IDs and locators.
