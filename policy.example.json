@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "clients": [
+    {
+      "id": "local-desktop-client",
+      "transport": "stdio",
+      "tools": ["list_folders", "search_mail", "get_message_metadata"],
+      "mailScope": {
+        "folders": [
+          "icloud-mail-v1.folder.WyJzeW50aGV0aWMtYWNjb3VudCIsWyJJbmJveCJdXQ"
+        ]
+      },
+      "allowBodies": false
+    },
+    {
+      "id": "loopback-http-client",
+      "transport": "http",
+      "tools": ["list_folders", "search_mail"],
+      "mailScope": "*",
+      "allowBodies": false,
+      "bearerTokenEnv": "ICLOUD_MCP_EXAMPLE_HTTP_TOKEN"
+    }
+  ]
+}

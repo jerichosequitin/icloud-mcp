@@ -94,6 +94,27 @@ describe('fixed AppleScript runner', () => {
     );
   });
 
+  test('all fixed scripts compare downstream account IDs case-sensitively', () => {
+    const operations: MailOperation[] = [
+      'listFolders',
+      'searchMail',
+      'getMessageMetadata',
+      'getMessageBodies',
+    ];
+
+    for (const operation of operations) {
+      const script = getMailScript(operation);
+      const findAccount = script.slice(
+        script.indexOf('on findAccount(accountId)'),
+        script.indexOf('end findAccount') + 'end findAccount'.length,
+      );
+      expect(findAccount).toContain('considering case');
+      expect(findAccount).toContain('if currentId is accountId');
+      expect(findAccount).toContain('end considering');
+      expect(findAccount.match(/currentId is accountId/g)).toHaveLength(1);
+    }
+  });
+
   test('stdout limit covers worst-case escaped body output', () => {
     expect(MAIL_LIMITS.stdoutBytes).toBeGreaterThan(
       MAIL_LIMITS.bodyMessages * MAIL_LIMITS.bodyCharacters * 6,

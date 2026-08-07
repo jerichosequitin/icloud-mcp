@@ -2,7 +2,7 @@
 
 An open-source project for a local iCloud Mail MCP integration.
 
-The current implementation includes a local, read-only Apple Mail adapter and four typed MCP tools exposed over stdio and loopback-only Streamable HTTP. Authentication, tunnels, and remote connectivity remain deferred to separately scoped work.
+The current implementation includes a local, read-only Apple Mail adapter and four typed MCP tools exposed over authenticated stdio and loopback-only Streamable HTTP. Every client has an explicit tool and Mail-folder policy, and every allowed adapter call or authorization denial is written to a local audit log.
 
 ## Read-only Mail adapter
 
@@ -28,19 +28,42 @@ The server discovers exactly four read-only tools:
 
 Only `get_message_bodies` returns message body content. Every successful call returns the validated structured result plus one JSON text block containing the same result for compatibility.
 
+## Access policy
+
+Set `ICLOUD_MCP_POLICY_PATH` to an absolute path for a versioned JSON policy stored outside this repository. The policy file and its parent directory must be owned by the current user; the file must have no group or world permissions, and the parent directory must not be group- or world-writable. The server refuses to start for a missing, relative, repository-local, malformed, or insecure policy. Copy [policy.example.json](policy.example.json) to a private configuration directory, set the file mode to `0600`, and replace the synthetic IDs and locators.
+
+Each client entry requires:
+
+- a stable `id`;
+- exactly one `transport`, either `stdio` or `http`;
+- an exact subset of the four read-only tools;
+- `mailScope` set explicitly to `"*"` or an allowlist of opaque folder locators;
+- an explicit `allowBodies` boolean;
+- for HTTP only, a `bearerTokenEnv` naming an environment variable that contains the token at launch.
+
+Token values never belong in the policy. Unknown keys, duplicate client IDs, duplicate tools or locators, unknown tools, invalid locators, HTTP token environment variables missing at HTTP startup, and transport-specific field mismatches all fail startup. Stdio startup does not resolve unused HTTP secrets from a shared policy. Account IDs and every mailbox-path segment are compared exactly and case-sensitively. Account display names, MCP client metadata, headers other than `Authorization`, and arbitrary request metadata never establish identity.
+
+`get_message_bodies` requires both tool permission and `allowBodies: true`. Folder listing is filtered to authorized locators before the requested limit is applied. Search is authorized before execution, and metadata or body batches containing any denied locator are rejected atomically.
+
 Run the local stdio server with:
 
 ```sh
+ICLOUD_MCP_POLICY_PATH=/absolute/private/policy.json \
+ICLOUD_MCP_CLIENT_ID=local-desktop-client \
 bun run mcp:stdio
 ```
+
+Stdio identity comes only from `ICLOUD_MCP_CLIENT_ID`. A missing, unknown, or HTTP-only client ID fails startup. The name and version reported by the MCP client are treated only as optional untrusted audit metadata.
 
 Run the Streamable HTTP server with:
 
 ```sh
+ICLOUD_MCP_POLICY_PATH=/absolute/private/policy.json \
+ICLOUD_MCP_EXAMPLE_HTTP_TOKEN='replace-with-a-random-secret' \
 bun run mcp:http
 ```
 
-The HTTP endpoint is exactly `http://127.0.0.1:3000/mcp`. Set a different local port with `PORT`, for example:
+The HTTP endpoint is exactly `http://127.0.0.1:3000/mcp` and every request requires `Authorization: Bearer <token>`. The token is compared in constant time and maps to the configured HTTP client ID before MCP dispatch. Missing, malformed, or invalid authentication receives a fixed `401` with a Bearer challenge. Set a different local port with `PORT`, for example:
 
 ```sh
 PORT=3100 bun run mcp:http
@@ -48,7 +71,13 @@ PORT=3100 bun run mcp:http
 
 HTTP always binds to `127.0.0.1`, accepts only loopback or `localhost` Host headers, and does not enable permissive CORS. Both transports support the MCP 2025 legacy era and the 2026-07-28 modern era through the official stable TypeScript SDK compatibility entry points.
 
-The HTTP transport is intentionally unauthenticated and unreachable from non-loopback interfaces in this issue. Do not expose it through a tunnel, proxy, DNS record, or public listener. Authentication and remote access remain out of scope until JER-110.
+Do not expose the HTTP server through a tunnel, proxy, DNS record, or public listener. OAuth and remote connector configuration remain separately scoped work.
+
+## Local audit log
+
+Audit entries are JSON Lines in `~/Library/Logs/icloud-mcp` by default. Set `ICLOUD_MCP_AUDIT_DIR` to a non-empty absolute path to use another local directory. Files roll over at UTC midnight as `audit-YYYY-MM-DD.jsonl`; the directory is mode `0700`, files are mode `0600`, and the latest 30 daily files are retained.
+
+Each record contains only a schema version, UTC timestamp, random event ID, authenticated client ID, transport, tool, allow or deny decision, fixed reason code, and protocol era. Untrusted MCP client metadata is omitted. Audit entries never contain bearer tokens, headers, policy scopes, queries, locators, Mail identifiers or content, adapter output, stack traces, or raw errors. If an allow record cannot be durably appended, the adapter is not invoked.
 
 ## Requirements
 
