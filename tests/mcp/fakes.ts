@@ -85,6 +85,7 @@ export function testPrincipal(
 }
 
 export class RecordingAuditLog implements AuditLog {
+  activeRecords = 0;
   readonly entries: AuditEntryInput[] = [];
   failure: unknown;
 
@@ -93,6 +94,19 @@ export class RecordingAuditLog implements AuditLog {
       throw this.failure;
     }
     this.entries.push(entry);
+  }
+
+  async runWithActiveRecord<Result>(
+    entry: AuditEntryInput,
+    operation: () => Promise<Result>,
+  ): Promise<Result> {
+    await this.append(entry);
+    this.activeRecords += 1;
+    try {
+      return await operation();
+    } finally {
+      this.activeRecords -= 1;
+    }
   }
 }
 
@@ -103,6 +117,7 @@ export interface AdapterCall {
 }
 
 export class FakeMailAdapter implements MailMcpAdapter {
+  beforeCall?: () => void;
   readonly calls: AdapterCall[] = [];
   failure: unknown;
   folders: ListFoldersResult = {
@@ -180,6 +195,7 @@ export class FakeMailAdapter implements MailMcpAdapter {
     if (this.failure !== undefined) {
       throw this.failure;
     }
+    this.beforeCall?.();
     this.calls.push({ input, operation });
   }
 }

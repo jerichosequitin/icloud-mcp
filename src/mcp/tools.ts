@@ -186,20 +186,22 @@ async function callAdapter<Result>(
   operation: () => Promise<Result>,
 ): Promise<CallToolResult> {
   try {
-    await options.audit.append(
+    return await options.audit.runWithActiveRecord(
       auditInput(options, tool, 'allow', 'ALLOW_POLICY'),
-    );
-    const parsed = outputSchema.safeParse(await operation());
-    if (!parsed.success) {
-      throw new MailAdapterError('MALFORMED_RESPONSE');
-    }
-    const result: CallToolResult = {
-      content: [{ type: 'text', text: JSON.stringify(parsed.data) }],
-      structuredContent: parsed.data as Record<string, unknown>,
-    };
-    return server.projectCallToolResult(
-      result,
-      TOOL_DEFINITIONS[tool].outputSchema,
+      async () => {
+        const parsed = outputSchema.safeParse(await operation());
+        if (!parsed.success) {
+          throw new MailAdapterError('MALFORMED_RESPONSE');
+        }
+        const result: CallToolResult = {
+          content: [{ type: 'text', text: JSON.stringify(parsed.data) }],
+          structuredContent: parsed.data as Record<string, unknown>,
+        };
+        return server.projectCallToolResult(
+          result,
+          TOOL_DEFINITIONS[tool].outputSchema,
+        );
+      },
     );
   } catch (error) {
     return errorResult(error);

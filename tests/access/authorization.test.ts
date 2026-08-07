@@ -262,6 +262,19 @@ describe('Mail access authorization', () => {
     expect(adapter.calls).toHaveLength(0);
   });
 
+  test('keeps the durable allow record active through adapter execution', async () => {
+    const adapter = new FakeMailAdapter();
+    const audit = new RecordingAuditLog();
+    adapter.beforeCall = () => expect(audit.activeRecords).toBe(1);
+
+    await withClient(adapter, audit, principal(), async (client) => {
+      await client.callTool({ arguments: { limit: 1 }, name: 'list_folders' });
+    });
+
+    expect(adapter.calls).toHaveLength(1);
+    expect(audit.activeRecords).toBe(0);
+  });
+
   test('keeps denials fixed while reporting denial audit failures safely', async () => {
     const adapter = new FakeMailAdapter();
     const audit = new RecordingAuditLog();

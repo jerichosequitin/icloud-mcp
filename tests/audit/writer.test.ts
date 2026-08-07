@@ -260,6 +260,104 @@ describe('local audit log', () => {
     ).toBe(0o600);
   });
 
+  test('retains another writer active across its audited invocation', async () => {
+    const directory = await makeAuditDirectory();
+    let markActive: () => void = () => undefined;
+    let releaseInvocation: () => void = () => undefined;
+    const active = new Promise<void>((resolveActive) => {
+      markActive = resolveActive;
+    });
+    const holdInvocation = new Promise<void>((resolveInvocation) => {
+      releaseInvocation = resolveInvocation;
+    });
+    const priorDay = new LocalAuditLog({
+      clock: () => new Date('2026-08-07T23:59:59.000Z'),
+      directory,
+      eventId: () => 'prior-day-event',
+      retentionFiles: 1,
+    });
+    const nextDay = new LocalAuditLog({
+      clock: () => new Date('2026-08-08T00:00:00.000Z'),
+      directory,
+      eventId: () => 'next-day-event',
+      retentionFiles: 1,
+    });
+    const invocation = priorDay.runWithActiveRecord(entry(), async () => {
+      markActive();
+      await holdInvocation;
+    });
+    await active;
+
+    await nextDay.append(entry());
+
+    const priorPath = join(directory, 'audit-2026-08-07.jsonl');
+    expect((await readdir(directory)).includes('audit-2026-08-07.jsonl')).toBe(
+      true,
+    );
+    expect(JSON.parse(await readFile(priorPath, 'utf8')).eventId).toBe(
+      'prior-day-event',
+    );
+
+    releaseInvocation();
+    await invocation;
+    await nextDay.append(entry());
+    expect((await readdir(directory)).includes('audit-2026-08-07.jsonl')).toBe(
+      false,
+    );
+  });
+
+  test('releases an active audit lease when its process terminates', async () => {
+    const directory = await makeAuditDirectory();
+    const writerModule = pathToFileURL(
+      join(process.cwd(), 'src', 'audit', 'writer.ts'),
+    ).href;
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        '--eval',
+        `import { LocalAuditLog } from ${JSON.stringify(writerModule)};
+const audit = new LocalAuditLog({
+  clock: () => new Date('2026-08-07T23:59:59.000Z'),
+  directory: ${JSON.stringify(directory)},
+  eventId: () => 'terminated-active-event',
+  retentionFiles: 1,
+});
+await audit.runWithActiveRecord({
+  clientId: 'synthetic-client',
+  decision: 'allow',
+  protocolEra: 'modern',
+  reason: 'ALLOW_POLICY',
+  tool: 'search_mail',
+  transport: 'http',
+}, async () => {
+  console.log('active');
+  await new Promise(() => undefined);
+});`,
+      ],
+      { stderr: 'pipe', stdout: 'pipe' },
+    );
+    const reader = child.stdout.getReader();
+    try {
+      const { value } = await reader.read();
+      expect(new TextDecoder().decode(value)).toContain('active');
+    } finally {
+      reader.releaseLock();
+      child.kill('SIGKILL');
+      await child.exited;
+    }
+
+    const nextDay = new LocalAuditLog({
+      clock: () => new Date('2026-08-08T00:00:00.000Z'),
+      directory,
+      retentionFiles: 1,
+    });
+    await nextDay.append(entry());
+
+    expect((await readdir(directory)).includes('audit-2026-08-07.jsonl')).toBe(
+      false,
+    );
+  });
+
   test('reclaims a valid audit lock after its owning process terminates', async () => {
     const directory = await makeAuditDirectory();
     const lockPath = auditLockPath(directory);
@@ -410,6 +508,8 @@ await withAuditFileLock(${JSON.stringify(lockPath)}, async () => {
     await audit.append(entry());
 
     expect((await readdir(directory)).sort()).toEqual([
+      '.audit-2026-08-01.jsonl.lock',
+      '.audit-2026-08-02.jsonl.lock',
       '.audit-2026-08-04.jsonl.lock',
       '.audit-2026-08-05.jsonl.lock',
       'audit-2026-01-01.jsonl.backup',
@@ -426,7 +526,7 @@ await withAuditFileLock(${JSON.stringify(lockPath)}, async () => {
     await mkdir(directory, { mode: 0o700 });
     const diagnostics: string[] = [];
     class FailingCleanupAuditLog extends LocalAuditLog {
-      protected override async cleanup(): Promise<void> {
+      protected override async cleanup(): Promise<boolean> {
         throw new Error(`private cleanup detail: ${directory}`);
       }
     }
@@ -456,6 +556,7 @@ await withAuditFileLock(${JSON.stringify(lockPath)}, async () => {
 
     expect((await readdir(directory)).sort()).toEqual([
       '.audit-2026-08-07.jsonl.lock',
+      '.audit-2027-01-01.jsonl.lock',
       'audit-2026-08-07.jsonl',
       'audit-2027-01-02.jsonl',
     ]);
@@ -466,11 +567,12 @@ await withAuditFileLock(${JSON.stringify(lockPath)}, async () => {
     const diagnostics: string[] = [];
     let cleanupAttempts = 0;
     class TransientCleanupAuditLog extends LocalAuditLog {
-      protected override async cleanup(): Promise<void> {
+      protected override async cleanup(): Promise<boolean> {
         cleanupAttempts += 1;
         if (cleanupAttempts === 1) {
           throw new Error('transient cleanup failure');
         }
+        return true;
       }
     }
     const audit = new TransientCleanupAuditLog({

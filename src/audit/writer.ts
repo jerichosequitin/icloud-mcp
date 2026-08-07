@@ -36,6 +36,7 @@ const AUDIT_LOCK_RETRY_LIMIT = 200;
 const AUDIT_LOCK_SCHEMA_VERSION = 1;
 const AUDIT_LOCK_METADATA_PATTERN =
   /^\{"ownerId":"([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})","pid":"(\d{10})","schemaVersion":1\}\n$/;
+const LOCK_SHARED_NONBLOCKING = 1 | 4;
 const LOCK_EXCLUSIVE_NONBLOCKING = 2 | 4;
 const LOCK_RELEASE = 8;
 const OPEN_CLOSE_ON_EXEC =
@@ -59,6 +60,10 @@ export const DEFAULT_AUDIT_RETENTION_FILES = 30;
 
 export interface AuditLog {
   append(entry: AuditEntryInput): Promise<void>;
+  runWithActiveRecord<Result>(
+    entry: AuditEntryInput,
+    operation: () => Promise<Result>,
+  ): Promise<Result>;
 }
 
 export interface LocalAuditLogOptions {
@@ -315,6 +320,11 @@ interface AuditLockMetadata {
   schemaVersion: typeof AUDIT_LOCK_SCHEMA_VERSION;
 }
 
+interface LockableHandle {
+  close(): Promise<void>;
+  readonly fd: number;
+}
+
 type LockHandle = Awaited<ReturnType<typeof open>>;
 
 function newLockMetadata(): AuditLockMetadata {
@@ -344,11 +354,15 @@ function validLockMetadata(contents: string): boolean {
   return Number.isSafeInteger(pid) && pid > 0;
 }
 
-function tryLock(handle: LockHandle): boolean {
+function tryLock(handle: LockableHandle): boolean {
   return libc.symbols.flock(handle.fd, LOCK_EXCLUSIVE_NONBLOCKING) === 0;
 }
 
-function releaseLock(handle: LockHandle): boolean {
+function trySharedLock(handle: LockableHandle): boolean {
+  return libc.symbols.flock(handle.fd, LOCK_SHARED_NONBLOCKING) === 0;
+}
+
+function releaseLock(handle: LockableHandle): boolean {
   return libc.symbols.flock(handle.fd, LOCK_RELEASE) === 0;
 }
 
@@ -459,26 +473,9 @@ async function openExistingAuditLock(
 export async function withAuditFileLock<T>(
   lockPath: string,
   operation: () => Promise<T>,
-  {
-    retryDelay = () => delay(AUDIT_LOCK_RETRY_DELAY_MS),
-    retryLimit = AUDIT_LOCK_RETRY_LIMIT,
-  }: AuditFileLockOptions = {},
+  options: AuditFileLockOptions = {},
 ): Promise<T> {
-  const metadata = newLockMetadata();
-  const encodedMetadata = serializeLockMetadata(metadata);
-  let lockHandle: LockHandle | undefined;
-  for (let attempt = 0; attempt < retryLimit; attempt += 1) {
-    lockHandle = await createLockedAuditFile(
-      lockPath,
-      metadata,
-      encodedMetadata,
-    );
-    lockHandle ??= await openExistingAuditLock(lockPath, encodedMetadata);
-    if (lockHandle !== undefined) {
-      break;
-    }
-    await retryDelay();
-  }
+  const lockHandle = await acquireAuditFileLock(lockPath, options);
   if (lockHandle === undefined) {
     throw new Error('Unable to acquire iCloud MCP audit lock.');
   }
@@ -493,20 +490,57 @@ export async function withAuditFileLock<T>(
     operationFailure = error;
   }
 
-  const releaseFailed = !releaseLock(lockHandle);
-  let closeFailed = false;
-  try {
-    await lockHandle.close();
-  } catch {
-    closeFailed = true;
-  }
-  if (releaseFailed || closeFailed) {
-    throw new Error('Unable to release iCloud MCP audit lock.');
-  }
+  await releaseLockedHandle(
+    lockHandle,
+    'Unable to release iCloud MCP audit lock.',
+  );
   if (operationFailed) {
     throw operationFailure;
   }
   return operationResult as T;
+}
+
+async function acquireAuditFileLock(
+  lockPath: string,
+  {
+    retryDelay = () => delay(AUDIT_LOCK_RETRY_DELAY_MS),
+    retryLimit = AUDIT_LOCK_RETRY_LIMIT,
+  }: AuditFileLockOptions = {},
+): Promise<LockHandle | undefined> {
+  const metadata = newLockMetadata();
+  const encodedMetadata = serializeLockMetadata(metadata);
+  let lockHandle: LockHandle | undefined;
+  for (let attempt = 0; attempt < retryLimit; attempt += 1) {
+    lockHandle = await createLockedAuditFile(
+      lockPath,
+      metadata,
+      encodedMetadata,
+    );
+    lockHandle ??= await openExistingAuditLock(lockPath, encodedMetadata);
+    if (lockHandle !== undefined) {
+      break;
+    }
+    if (attempt + 1 < retryLimit) {
+      await retryDelay();
+    }
+  }
+  return lockHandle;
+}
+
+async function releaseLockedHandle(
+  handle: LockableHandle,
+  errorMessage: string,
+): Promise<void> {
+  const releaseFailed = !releaseLock(handle);
+  let closeFailed = false;
+  try {
+    await handle.close();
+  } catch {
+    closeFailed = true;
+  }
+  if (releaseFailed || closeFailed) {
+    throw new Error(errorMessage);
+  }
 }
 
 function validRetention(value: number): boolean {
@@ -739,38 +773,64 @@ async function openSecureAuditFile(
     throw new Error('Invalid iCloud MCP audit file.');
   }
 
-  let existing: { dev: number; ino: number } | undefined;
+  const existingHandle = await openExistingSecureAuditFile(
+    directoryHandle,
+    filename,
+    path,
+  );
+  if (existingHandle !== undefined) {
+    return { created: false, handle: existingHandle };
+  }
+
+  return {
+    created: true,
+    handle: openAuditFileAt(
+      directoryHandle,
+      filename,
+      constants.O_APPEND |
+        constants.O_RDWR |
+        constants.O_CREAT |
+        constants.O_EXCL,
+    ),
+  };
+}
+
+async function openExistingSecureAuditFile(
+  directoryHandle: FileHandle,
+  filename: string,
+  path: string,
+): Promise<SecureAuditFileHandle | undefined> {
+  if (!AUDIT_FILENAME_PATTERN.test(filename)) {
+    throw new Error('Invalid iCloud MCP audit file.');
+  }
+
+  let existing: { dev: number; ino: number };
   try {
     const current = await lstat(path);
     existing = { dev: current.dev, ino: current.ino };
   } catch (error) {
-    if (errorCode(error) !== 'ENOENT') {
-      throw error;
+    if (errorCode(error) === 'ENOENT') {
+      return undefined;
     }
+    throw error;
   }
 
-  const created = existing === undefined;
   const handle = openAuditFileAt(
     directoryHandle,
     filename,
-    constants.O_APPEND |
-      constants.O_RDWR |
-      (created ? constants.O_CREAT | constants.O_EXCL : 0),
+    constants.O_APPEND | constants.O_RDWR,
   );
-  if (existing !== undefined) {
-    try {
-      const opened = await handle.stat();
-      if (sameFile(opened, existing)) {
-        return { created, handle };
-      }
-    } catch (error) {
-      await handle.close();
-      throw error;
+  try {
+    const opened = await handle.stat();
+    if (sameFile(opened, existing)) {
+      return handle;
     }
+  } catch (error) {
     await handle.close();
-    throw new Error('Invalid iCloud MCP audit file.');
+    throw error;
   }
-  return { created, handle };
+  await handle.close();
+  throw new Error('Invalid iCloud MCP audit file.');
 }
 
 async function validateAuditFile(
@@ -832,16 +892,58 @@ export class LocalAuditLog implements AuditLog {
   }
 
   append(input: AuditEntryInput): Promise<void> {
-    const operation = this.#writeQueue.then(
-      () => this.#append(input),
-      () => this.#append(input),
-    );
-    this.#writeQueue = operation.catch(() => undefined);
-    return operation;
+    const now = this.#clock();
+    return this.#enqueue(async () => {
+      await this.#append(input, now, false);
+    });
   }
 
-  async #append(input: AuditEntryInput): Promise<void> {
+  async runWithActiveRecord<Result>(
+    input: AuditEntryInput,
+    operation: () => Promise<Result>,
+  ): Promise<Result> {
     const now = this.#clock();
+    const activeHandle = await this.#enqueue(() =>
+      this.#append(input, now, true),
+    );
+    if (activeHandle === undefined) {
+      throw new Error('Unable to acquire iCloud MCP active audit lease.');
+    }
+
+    let operationResult: Result | undefined;
+    let operationFailure: unknown;
+    let operationFailed = false;
+    try {
+      operationResult = await operation();
+    } catch (error) {
+      operationFailed = true;
+      operationFailure = error;
+    }
+
+    await releaseLockedHandle(
+      activeHandle,
+      'Unable to release iCloud MCP active audit lease.',
+    );
+    if (operationFailed) {
+      throw operationFailure;
+    }
+    return operationResult as Result;
+  }
+
+  #enqueue<Result>(operation: () => Promise<Result>): Promise<Result> {
+    const queued = this.#writeQueue.then(operation, operation);
+    this.#writeQueue = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return queued;
+  }
+
+  async #append(
+    input: AuditEntryInput,
+    now: Date,
+    retainActive: boolean,
+  ): Promise<SecureAuditFileHandle | undefined> {
     const timestamp = now.toISOString();
     const date = timestamp.slice(0, 10);
     const activeFilename = `audit-${date}.jsonl`;
@@ -854,8 +956,11 @@ export class LocalAuditLog implements AuditLog {
     const line = `${JSON.stringify(entry)}\n`;
 
     const directory = await openSecureAuditDirectory(this.#directory);
+    let activeHandle: SecureAuditFileHandle | undefined;
+    let appendFailure: unknown;
+    let appendFailed = false;
     try {
-      await withAuditFileLock(
+      activeHandle = await withAuditFileLock(
         join(this.#directory, `.${activeFilename}.lock`),
         async () => {
           await directory.validate();
@@ -865,6 +970,7 @@ export class LocalAuditLog implements AuditLog {
             activeFilename,
             auditPath,
           );
+          let keepHandle = false;
           try {
             const expectedOwner = process.getuid?.();
             if (expectedOwner === undefined) {
@@ -883,8 +989,21 @@ export class LocalAuditLog implements AuditLog {
             await appendAuditLine(handle, line);
             await validateAuditFile(handle, auditPath, expectedOwner);
             await directory.validate();
+            if (retainActive) {
+              if (!trySharedLock(handle)) {
+                throw new Error(
+                  'Unable to acquire iCloud MCP active audit lease.',
+                );
+              }
+              keepHandle = true;
+              activeHandle = handle;
+              return handle;
+            }
+            return undefined;
           } finally {
-            await handle.close();
+            if (!keepHandle) {
+              await handle.close();
+            }
           }
         },
       );
@@ -892,19 +1011,42 @@ export class LocalAuditLog implements AuditLog {
       if (this.#lastCleanupDate !== date) {
         try {
           await directory.validate();
-          await this.cleanup(activeFilename);
+          const cleanupComplete = await this.cleanup(activeFilename, directory);
           await directory.validate();
-          this.#lastCleanupDate = date;
+          if (cleanupComplete) {
+            this.#lastCleanupDate = date;
+          }
         } catch {
           this.#diagnostics('iCloud MCP audit retention cleanup failed.');
         }
       }
+    } catch (error) {
+      appendFailed = true;
+      appendFailure = error;
     } finally {
-      await directory.handle.close();
+      try {
+        await directory.handle.close();
+      } catch (error) {
+        appendFailed = true;
+        appendFailure = error;
+      }
     }
+    if (appendFailed) {
+      if (activeHandle !== undefined) {
+        await releaseLockedHandle(
+          activeHandle,
+          'Unable to release iCloud MCP active audit lease.',
+        );
+      }
+      throw appendFailure;
+    }
+    return activeHandle;
   }
 
-  protected async cleanup(activeFilename: string): Promise<void> {
+  protected async cleanup(
+    activeFilename: string,
+    directory: SecureAuditDirectory,
+  ): Promise<boolean> {
     const entries = await readdir(this.#directory, { withFileTypes: true });
     const auditFiles = entries
       .filter(
@@ -916,8 +1058,58 @@ export class LocalAuditLog implements AuditLog {
     const inactiveFiles = auditFiles.filter(
       (filename) => filename !== activeFilename,
     );
+    let cleanupComplete = true;
     for (const filename of inactiveFiles.slice(this.#retentionFiles - 1)) {
-      await unlink(join(this.#directory, filename));
+      const lockHandle = await acquireAuditFileLock(
+        join(this.#directory, `.${filename}.lock`),
+        { retryLimit: 1 },
+      );
+      if (lockHandle === undefined) {
+        cleanupComplete = false;
+        continue;
+      }
+
+      try {
+        const auditPath = join(this.#directory, filename);
+        const auditHandle = await openExistingSecureAuditFile(
+          directory.handle,
+          filename,
+          auditPath,
+        );
+        if (auditHandle === undefined) {
+          continue;
+        }
+        let activeLockHeld = false;
+        try {
+          const expectedOwner = process.getuid?.();
+          if (expectedOwner === undefined) {
+            throw new Error('Invalid iCloud MCP audit file.');
+          }
+          await validateAuditFile(auditHandle, auditPath, expectedOwner);
+          if (!tryLock(auditHandle)) {
+            cleanupComplete = false;
+            continue;
+          }
+          activeLockHeld = true;
+          await validateAuditFile(auditHandle, auditPath, expectedOwner);
+          await unlink(auditPath);
+        } finally {
+          if (activeLockHeld) {
+            await releaseLockedHandle(
+              auditHandle,
+              'Unable to release iCloud MCP retention audit lock.',
+            );
+          } else {
+            await auditHandle.close();
+          }
+        }
+      } finally {
+        await releaseLockedHandle(
+          lockHandle,
+          'Unable to release iCloud MCP audit lock.',
+        );
+      }
     }
+    return cleanupComplete;
   }
 }
